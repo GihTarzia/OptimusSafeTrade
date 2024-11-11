@@ -1,0 +1,13 @@
+#numpy==1.23.5
+#pandas==1.5.3
+scikit-learn==1.2.2
+xgboost==1.7.5
+#optuna==3.2.0
+#yfinance==0.2.18
+python-telegram-bot==20.3
+colorama==0.4.6
+ta==0.10.2
+plotly==5.14.1
+SQLAlchemy==1.4.46
+PyYAML==6.0.1
+schedule==1.2.0

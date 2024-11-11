@@ -1,0 +1,105 @@
+sistema:
+  modo: 'producao'  # 'producao' ou 'teste'
+  debug: false
+  auto_restart: true
+  max_memoria: 1024  # MB
+  backup_interval: 3600  # 1 hora
+
+trading:
+  saldo_inicial: 1000
+  risco_por_operacao: 0.02  # 2%
+  stop_diario: -0.1  # -10%
+  meta_diaria: 0.05  # 5%
+  max_operacoes_dia: 15
+  min_intervalo_operacoes: 300  # 5 minutos
+  tempo_expiracao_padrao: 5  # minutos
+  martingale:
+    ativo: false
+    multiplicador: 2.0
+    max_niveis: 2
+
+analise:
+  rsi:
+    periodo: 9
+    sobrevenda: 25
+    sobrecompra: 75
+  medias_moveis:
+    curta: 10
+    media: 21
+    longa: 50
+  bandas_bollinger:
+    periodo: 14
+    desvio: 2.2
+  min_score_entrada: 2.0
+  min_assertividade: 65
+  min_volatilidade: 0.001
+  max_volatilidade: 0.005
+
+ativos:
+  forex:
+    - 'EURUSD=X'
+    - 'GBPUSD=X'
+    - 'USDJPY=X'
+    - 'AUDUSD=X'
+    - 'USDCAD=X'
+    - 'NZDUSD=X'
+  indices:
+    - '^GSPC'  # S&P 500
+    - '^DJI'   # Dow Jones
+    - '^IXIC'  # NASDAQ
+  commodities:
+    - 'GC=F'   # Ouro
+    - 'CL=F'   # Petróleo
+    - 'SI=F'   # Prata
+
+horarios:
+  inicio_operacoes: '09:00'
+  fim_operacoes: '17:00'
+  horarios_bloqueados:
+    - '12:00-13:00'  # Horário de almoço
+  dias_operacionais:
+    - 'Monday'
+    - 'Tuesday'
+    - 'Wednesday'
+    - 'Thursday'
+    - 'Friday'
+
+ml_config:
+  treino_automatico: true
+  intervalo_treino: 86400  # 24 horas
+  min_amostras_treino: 1000
+  validacao_cruzada: true
+  early_stopping: true
+  max_depth: 5
+  learning_rate: 0.05
+  n_estimators: 200
+
+filtros:
+  tendencia:
+    min_inclinacao: 0.001
+    periodo_analise: 20
+  volume:
+    min_volume: 1000
+    multiplicador_media: 1.5
+  spread:
+    max_spread: 0.0003
+
+indicadores_personalizados:
+  pesos:
+    rsi: 2.0
+    medias_moveis: 1.5
+    bollinger: 1.8
+    volume: 1.0
+    tendencia: 2.0
+    padrao_candlestick: 1.2
+
+notificacoes:
+  telegram:
+    ativo: false
+    token: '7906357537:AAHIU7JotNw2bQ46cSnruCtRmC65DCTAGvQ'
+    chat_id: '-4561526671'
+    eventos:
+      - 'entrada'
+      - 'saida'
+      - 'erro'
+      - 'stop_diario'

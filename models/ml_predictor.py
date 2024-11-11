@@ -6,22 +6,25 @@ from xgboost import XGBClassifier
 import yfinance as yf
 from datetime import datetime, timedelta
 import ta
+from colorama import Fore, Style
 import warnings
 warnings.filterwarnings('ignore')
 
 class MLPredictor:
-    def __init__(self):
+    def __init__(self, logger):
         self.model = None
+        self.logger = logger
         self.scaler = StandardScaler()
         self.min_probabilidade = 0.65  # Probabilidade mínima para considerar um sinal
         self.janela_analise = 20  # Períodos para análise
         self.features_importance = {}
-        
-        
+
     def criar_features(self, df):
         """Cria features para o modelo de ML"""
         try:
             features = pd.DataFrame()
+            
+            print("Calculando indicadores técnicos...")
             
             # RSI
             features['rsi'] = ta.momentum.RSIIndicator(df['Close']).rsi()
@@ -54,8 +57,8 @@ class MLPredictor:
             features['momentum'] = ta.momentum.ROCIndicator(df['Close']).roc()
             
             # Volume
-            if 'Volume' in df.columns:
-                features['volume_change'] = np.log(df['Volume']).diff()
+            if 'Volume' in df.columns and df['Volume'].sum() > 0:
+                features['volume_change'] = df['Volume'].pct_change()
             
             # Tendências
             for periodo in [5, 10, 20]:
@@ -66,65 +69,106 @@ class MLPredictor:
             features = features.replace([np.inf, -np.inf], np.nan)
             features = features.fillna(method='ffill').fillna(0)
             
+            print(f"Features criadas: {features.shape[1]} indicadores")
             return features
-            
+                
         except Exception as e:
             print(f"Erro ao criar features: {str(e)}")
-            return None
-        
+            return None        
+ 
     def treinar(self, dados_historicos):
         """Treina o modelo de ML"""
         try:
-            # Prepara features e labels
-            features = self.criar_features(dados_historicos)
-            if features is None:
+            print("\nIniciando treinamento do modelo ML...")
+
+            if dados_historicos.empty:
+                print("Sem dados históricos suficientes para treino")
                 return False
 
-            # Remove registros com dados faltantes
-            valid_idx = ~features.isnull().any(axis=1)
-            features = features[valid_idx]
-            
-            # Cria labels (1 para alta, 0 para baixa)
-            retornos_futuros = dados_historicos['Close'].pct_change().shift(-1)
-            labels = (retornos_futuros > 0).astype(int)
-            labels = labels[valid_idx]
-            
-            # Divide dados em treino e teste
-            X_train, X_test, y_train, y_test = train_test_split(
-                features, labels, test_size=0.2, random_state=42
-            )
-            
-            # Normaliza features
-            X_train_scaled = self.scaler.fit_transform(X_train)
-            
-            # Treina modelo
-            self.model = XGBClassifier(
-                max_depth=5,
-                learning_rate=0.05,
-                n_estimators=200,
-                objective='binary:logistic',
-                random_state=42
-            )
-            
-            self.model.fit(
-                X_train_scaled,
-                y_train,
-                eval_set=[(self.scaler.transform(X_test), y_test)],
-                eval_metric='logloss',
-                early_stopping_rounds=20,
-                verbose=False
-            )
-            
-            # Armazena importância das features
-            self.features_importance = dict(zip(
-                features.columns,
-                self.model.feature_importances_
-            ))
-            
+            print(f"Total de dados recebidos: {len(dados_historicos)} registros")
+
+            # Dicionário para armazenar modelos por ativo
+            self.models = {}
+
+            # Treina um modelo para cada ativo
+            for ativo in dados_historicos['ativo'].unique():
+                print(f"\n{Fore.CYAN}Treinando modelo para {ativo}{Style.RESET_ALL}")
+                dados_ativo = dados_historicos[dados_historicos['ativo'] == ativo].copy()
+
+                if len(dados_ativo) < 100:
+                    print(f"Dados insuficientes para {ativo} ({len(dados_ativo)} registros)")
+                    continue
+
+                # Organiza os dados por timestamp
+                dados_ativo = dados_ativo.sort_values('timestamp')
+
+                # Cria features
+                print("Criando features...")
+                features = self.criar_features(dados_ativo)
+                if features is None:
+                    print(f"Erro ao criar features para {ativo}")
+                    continue
+
+                # Remove registros com dados faltantes
+                valid_idx = ~features.isnull().any(axis=1)
+                features = features[valid_idx]
+
+                # Cria labels (1 para alta, 0 para baixa)
+                retornos_futuros = dados_ativo['Close'].pct_change().shift(-1)
+                labels = (retornos_futuros > 0).astype(int)
+                labels = labels[valid_idx]
+
+                print(f"Features criadas: {len(features)} registros")
+
+                # Divide dados em treino e teste
+                X_train, X_test, y_train, y_test = train_test_split(
+                    features, labels, test_size=0.2, random_state=42
+                )
+
+                # Normaliza features
+                X_train_scaled = self.scaler.fit_transform(X_train)
+                X_test_scaled = self.scaler.transform(X_test)
+
+                print("Treinando modelo...")
+                # Treina modelo
+                model = XGBClassifier(
+                    max_depth=5,
+                    learning_rate=0.05,
+                    n_estimators=200,
+                    objective='binary:logistic',
+                    random_state=42
+                )
+
+                model.fit(
+                    X_train_scaled,
+                    y_train,
+                    eval_set=[(X_test_scaled, y_test)],
+                    eval_metric='logloss',
+                    early_stopping_rounds=20,
+                    verbose=False
+                )
+
+                # Avalia modelo
+                y_pred = model.predict(X_test_scaled)
+                accuracy = (y_pred == y_test).mean()
+
+                print(f"{Fore.GREEN}Modelo treinado para {ativo}")
+                print(f"Acurácia: {accuracy:.2%}{Style.RESET_ALL}")
+
+                # Salva modelo
+                self.models[ativo] = {
+                    'model': model,
+                    'scaler': self.scaler,
+                    'accuracy': accuracy,
+                    'features': features.columns.tolist()
+                }
+
+            print(f"\n{Fore.GREEN}Treinamento concluído!")
+            print(f"Modelos treinados: {len(self.models)}{Style.RESET_ALL}")
             return True
-            
+
         except Exception as e:
-            print(f"Erro no treinamento: {str(e)}")
+            print(f"{Fore.RED}Erro durante o treinamento: {str(e)}{Style.RESET_ALL}")
             return False
 
     def prever(self, dados):

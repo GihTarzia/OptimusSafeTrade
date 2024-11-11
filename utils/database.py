@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import json
 from typing import Dict, List, Optional, Union
 import threading
+from colorama import Fore, Style
 from pathlib import Path
 
 class DatabaseManager:
@@ -55,7 +56,7 @@ class DatabaseManager:
                     UNIQUE(ativo, timestamp)
                 )
             ''')
-            
+
             # Tabela de métricas
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS metricas (
@@ -123,9 +124,41 @@ class DatabaseManager:
         with self.lock:
             try:
                 with self.get_connection() as conn:
-                    dados.to_sql('precos', conn, if_exists='append', index=False)
+                    # Remove a coluna 'Adj Close' se existir
+                    if 'Adj Close' in dados.columns:
+                        dados = dados.drop('Adj Close', axis=1)
+
+                    # Prepara os dados
+                    dados_para_salvar = dados.copy()
+
+                    # Renomeia as colunas para minúsculo
+                    dados_para_salvar.columns = [col.lower() for col in dados_para_salvar.columns]
+
+                    # Se a coluna 'datetime' existe, renomeia para 'timestamp'
+                    if 'datetime' in dados_para_salvar.columns:
+                        dados_para_salvar = dados_para_salvar.rename(columns={'datetime': 'timestamp'})
+                                                                     
+                    # Adiciona a coluna do ativo
+                    dados_para_salvar['ativo'] = ativo
+
+                    # Garante que temos todas as colunas necessárias
+                    colunas_necessarias = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'ativo']
+                    for col in colunas_necessarias:
+                        if col not in dados_para_salvar.columns:
+                            if col == 'volume':
+                                dados_para_salvar[col] = 0
+                            else:
+                                raise ValueError(f"Coluna obrigatória ausente: {col}")
+                            
+                    # Converte timestamp para string no formato correto
+                    dados_para_salvar['timestamp'] = pd.to_datetime(dados_para_salvar['timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
+                
+                    # Salva no banco
+                    dados_para_salvar.to_sql('precos', conn, if_exists='append', index=False)
+
             except Exception as e:
-                print(f"Erro ao salvar preços: {str(e)}")
+                print(f"Erro ao salvar preços para {ativo}: {str(e)}")
+                print("Colunas disponíveis:", dados.columns.tolist())
 
     def get_dados_mercado(self, ativo: str, limite: int = 1000) -> pd.DataFrame:
         """Recupera dados históricos do mercado"""
@@ -142,18 +175,34 @@ class DatabaseManager:
 
     def get_dados_treino(self) -> pd.DataFrame:
         """Recupera dados para treino do modelo ML"""
-        query = '''
-            SELECT s.*, p.open, p.high, p.low, p.close, p.volume
-            FROM sinais s
-            JOIN precos p ON s.ativo = p.ativo 
-                AND s.timestamp = p.timestamp
-            WHERE s.resultado IS NOT NULL
-            ORDER BY s.timestamp DESC
+        try:
+            query = '''
+            SELECT DISTINCT
+                p.timestamp,
+                p.open as Open,
+                p.high as High,
+                p.low as Low,
+                p.close as Close,
+                p.volume as Volume,
+                p.ativo
+            FROM precos p
+            ORDER BY p.timestamp DESC
             LIMIT 10000
-        '''
-        
-        with self.get_connection() as conn:
-            return pd.read_sql_query(query, conn)
+            '''
+
+            with self.get_connection() as conn:
+                df = pd.read_sql_query(query, conn)
+                print(f"Dados recuperados do banco: {len(df)} registros")
+                if df.empty:
+                    print("Nenhum dado encontrado no banco")
+                else:
+                    print("Colunas disponíveis:", df.columns.tolist())
+                    print("Ativos únicos:", df['ativo'].unique().tolist())
+                    print("Período dos dados:", df['timestamp'].min(), "até", df['timestamp'].max())
+                return df
+        except Exception as e:
+            print(f"{Fore.RED}Erro ao recuperar dados de treino: {str(e)}{Style.RESET_ALL}")
+            return pd.DataFrame()
 
     def get_estatisticas(self, periodo: str = '1d') -> Dict:
         """Recupera estatísticas de performance"""

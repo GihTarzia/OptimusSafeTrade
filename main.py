@@ -2,9 +2,11 @@ import os
 import sys
 import schedule
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from colorama import init, Fore, Style
 from pathlib import Path
+from tqdm import tqdm
+import yfinance as yf
 
 # Adiciona o diretório raiz ao PATH
 project_root = Path(__file__).parent
@@ -18,19 +20,36 @@ from models.auto_ajuste import AutoAjuste
 from utils.logger import TradingLogger
 from utils.database import DatabaseManager
 from config.parametros import Config
-from datetime import datetime, timedelta  # Adiciona timedelta aqui
 
 class TradingSystem:
     def __init__(self):
+        print(f"{Fore.CYAN}Iniciando Trading Bot...{Style.RESET_ALL}")
         self.logger = TradingLogger()
         self.db = DatabaseManager()
         self.config = Config()
         
-        # Inicializa componentes principais
+        # Inicializa componentes principais com barra de progresso
+        componentes = [
+            ("Logger", self.logger),
+            ("Banco de Dados", self.db),
+            ("Configurações", self.config),
+            ("ML Predictor", MLPredictor(self.logger)),
+            ("Análise de Padrões", AnalisePadroesComplexos()),
+            ("Gestão de Risco", GestaoRiscoAdaptativo(self.config.get('trading.saldo_inicial', 1000))),
+        ]
+
+        print(f"\n{Fore.YELLOW}Inicializando componentes...{Style.RESET_ALL}")
+        for nome, componente in tqdm(componentes, desc="Progresso"):
+            if nome == "ML Predictor":
+                self.ml_predictor = componente
+            elif nome == "Análise de Padrões":
+                self.analise_padroes = componente
+            elif nome == "Gestão de Risco":
+                self.gestao_risco = componente
+
+        # Inicializa otimizadores
+        print(f"\n{Fore.YELLOW}Configurando otimizadores...{Style.RESET_ALL}")
         self.auto_otimizador = AutoOtimizador(self.config, self.db, self.logger)
-        self.ml_predictor = MLPredictor()
-        self.analise_padroes = AnalisePadroesComplexos()
-        self.gestao_risco = GestaoRiscoAdaptativo(self.config.get('trading.saldo_inicial', 1000))
         self.auto_ajuste = AutoAjuste(self.config, self.db, self.logger)
         
         # Estatísticas e histórico
@@ -62,7 +81,7 @@ class TradingSystem:
             if horario_atual < melhor_horario:
                 tempo_espera = datetime.combine(agora.date(), melhor_horario) - datetime.combine(agora.date(), horario_atual)
             else:
-                tempo_espera = timedelta(minutes=1)  # Entrada no próximo minuto
+                tempo_espera = timedelta(minutes=1)
         else:
             tempo_espera = timedelta(minutes=1)
         
@@ -103,13 +122,45 @@ class TradingSystem:
         
         return round(assertividade * 100, 2)  # Retorna porcentagem
 
+    def baixar_dados_historicos(self):
+        """Baixa dados históricos iniciais para todos os ativos"""
+        print(f"{Fore.YELLOW}Iniciando download de dados históricos...{Style.RESET_ALL}")
+
+        ativos = self.config.get_ativos_ativos()
+        for ativo in tqdm(ativos, desc="Baixando dados"):
+            try:
+                # Download de 30 dias de dados em intervalos de 5 minutos
+                dados = yf.download(
+                    ativo,
+                    period="30d",
+                    interval="5m",
+                    progress=False
+                )
+
+                if not dados.empty:
+                    print(f"\nBaixados {len(dados)} registros para {ativo}")
+                    print("Colunas disponíveis:", dados.columns.tolist())
+                    # Prepara os dados para salvar
+                    dados_para_salvar = dados.reset_index()
+                    dados_para_salvar['ativo'] = ativo
+
+                    # Salva no banco de dados
+                    self.db.salvar_precos(ativo, dados_para_salvar)
+                    print(f"{Fore.GREEN}Dados baixados com sucesso para {ativo}: {len(dados)} registros{Style.RESET_ALL}")
+                else:
+                    print(f"{Fore.RED}Nenhum dado disponível para {ativo}{Style.RESET_ALL}")
+
+            except Exception as e:
+                print(f"{Fore.RED}Erro ao baixar dados para {ativo}: {str(e)}{Style.RESET_ALL}")
+
     def analisar_mercado(self):
         """Análise principal do mercado"""
         self.logger.info(f"\n{Fore.CYAN}=== Nova Análise ==={Style.RESET_ALL}")
         self.logger.info(f"Hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*50)
         
-        for ativo in self.config.get_ativos_ativos():
+        ativos = self.config.get_ativos_ativos()
+        for ativo in tqdm(ativos, desc="Analisando ativos"):
             try:
                 # Análise técnica e ML
                 sinal = self.ml_predictor.analisar(ativo)
@@ -142,7 +193,7 @@ class TradingSystem:
                             self.registrar_sinal(ativo, sinal, timing, assertividade, risco)
                 
             except Exception as e:
-                self.logger.erro(f"Erro ao analisar {ativo}: {str(e)}")
+                self.logger.error(f"Erro ao analisar {ativo}: {str(e)}")
 
     def exibir_resultado(self, ativo, sinal, timing, assertividade, risco):
         """Exibe o resultado da análise de forma formatada"""
@@ -174,12 +225,27 @@ class TradingSystem:
     def executar(self):
         """Loop principal do sistema"""
         try:
+            print(f"\n{Fore.CYAN}Iniciando sequência de inicialização...{Style.RESET_ALL}")
+            
             # Inicializa modelos e dados históricos
-            self.logger.info("Inicializando sistema...")
+            print(f"\n{Fore.YELLOW}Fase 1: Baixando dados históricos...{Style.RESET_ALL}")
+            self.baixar_dados_historicos()
+
+            # Aqui você pode adicionar uma barra de progresso para o download
+            
+            print(f"\n{Fore.YELLOW}Fase 2: Treinando modelo ML...{Style.RESET_ALL}")
             self.ml_predictor.treinar(self.db.get_dados_treino())
+            
+            print(f"\n{Fore.GREEN}Sistema pronto! Iniciando primeira análise...{Style.RESET_ALL}")
+            
+            # Faz primeira análise imediatamente
+            self.analisar_mercado()
             
             # Agenda análises regulares
             schedule.every(1).minutes.do(self.analisar_mercado)
+            
+            print(f"\n{Fore.GREEN}Sistema em execução contínua. Pressione Ctrl+C para encerrar.{Style.RESET_ALL}")
+            print(f"Próxima análise em 1 minuto...")
             
             # Loop principal
             while True:
@@ -189,7 +255,7 @@ class TradingSystem:
         except KeyboardInterrupt:
             self.logger.info("Sistema encerrado pelo usuário")
         except Exception as e:
-            self.logger.erro(f"Erro crítico: {str(e)}")
+            self.logger.error(f"Erro crítico: {str(e)}")
 
 if __name__ == "__main__":
     init()  # Inicializa colorama

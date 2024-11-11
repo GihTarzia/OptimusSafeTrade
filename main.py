@@ -70,8 +70,11 @@ class TradingSystem:
 
     async def _notificar_sinal(self, sinal: Dict):
         """Envia notificação de sinal"""
-        mensagem = self.notificador.formatar_sinal(sinal)
-        await self.notificador.enviar_mensagem(mensagem)
+        try:
+            mensagem = self.notificador.formatar_sinal(sinal)
+            await self.notificador.enviar_mensagem(mensagem)
+        except Exception as e:
+            self.logger.error(f"Erro ao notificar sinal: {str(e)}")
 
     async def _notificar_resultado(self, operacao: Dict):
         """Envia notificação de resultado"""
@@ -193,7 +196,7 @@ class TradingSystem:
 
                 if not dados.empty:
                     print(f"\nBaixados {len(dados)} registros para {ativo}")
-                    print("Colunas disponíveis:", dados.columns.tolist())
+                    #print("Colunas disponíveis:", dados.columns.tolist())
                     # Prepara os dados para salvar
                     dados_para_salvar = dados.reset_index()
                     dados_para_salvar['ativo'] = ativo
@@ -278,7 +281,7 @@ class TradingSystem:
             return {'operar': False, 'motivo': f"Erro na análise: {str(e)}", 'score_mercado': 0}
     
 
-    def analisar_mercado(self):
+    async def analisar_mercado(self):
         """Análise principal do mercado"""
         print(f"\n{Fore.CYAN}=== Nova Análise ==={Style.RESET_ALL}")
         print(f"Hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -393,14 +396,41 @@ class TradingSystem:
             
             # Exibe resultados
             self._exibir_resumo_analise(sinais_validos)
-            
+            #self._notificar_resultado(sinais_validos)
+
             # Registra sinais válidos
             for sinal in sinais_validos:
-                self.registrar_sinal(**sinal)
+                    try:
+                        dados_registro = self._formatar_sinal_para_registro(sinal)
+                        self.registrar_sinal(**dados_registro)
+                        await self._notificar_sinal(dados_registro)
+                    except Exception as e:
+                        print(f"Erro ao processar sinal: {str(e)}")
+                        return ""
         else:
             print(f"\n{Fore.YELLOW}Nenhum sinal válido encontrado neste momento{Style.RESET_ALL}")
         
         print(f"\nPróxima análise em 30 segundos...")
+
+    # Antes de chamar registrar_sinal, vamos ajustar o formato dos dados
+    def _formatar_sinal_para_registro(self, sinal_dados: Dict) -> Dict:
+        """Formata os dados do sinal para registro"""
+        return {
+            'ativo': sinal_dados['ativo'],
+            'direcao': sinal_dados['sinal']['direcao'],
+            'momento_entrada': sinal_dados['timing']['momento_ideal'],
+            'tempo_expiracao': sinal_dados['sinal']['tempo_expiracao'],
+            'score': sinal_dados['sinal']['score'],
+            'assertividade': sinal_dados['assertividade'],
+            'padroes': sinal_dados['sinal']['sinais'],
+            'indicadores': {
+                'ml_prob': sinal_dados['sinal']['ml_prob'],
+                'padroes_forca': sinal_dados['sinal']['padroes_força'],
+                'tendencia': sinal_dados['sinal']['tendencia']
+            },
+            'ml_prob': sinal_dados['sinal']['ml_prob'],
+            'volatilidade': sinal_dados['sinal']['volatilidade']
+        }
 
     def _combinar_analises(self, ativo: str, sinal_ml: Dict, analise_padroes: Dict, dados_mercado: pd.DataFrame) -> Dict:
         """Combina análises ML e técnica"""
@@ -589,34 +619,7 @@ class TradingSystem:
             
         except Exception as e:
             self.logger.error(f"{Fore.RED}Erro ao exibir estatísticas: {str(e)}{Style.RESET_ALL}")
-
-    def _formatar_mensagem_telegram(self, sinal: Dict) -> str:
-        """Formata mensagem para envio no Telegram"""
-        try:
-            s = sinal['sinal']
-            timing = sinal['timing']
-            
-            mensagem = [
-                f"🎯 *Sinal {s['direcao']} para {sinal['ativo']}*",
-                f"",
-                f"⏰ Entrada: {timing['momento_ideal'].strftime('%H:%M:%S')}",
-                f"⌛️ Expiração: {s['tempo_expiracao']} minutos",
-                f"",
-                f"📊 Qualidade do Sinal:",
-                f"• Score: {sinal['score_final']:.2%}",
-                f"• Assertividade: {sinal['assertividade']:.1f}%",
-                f"",
-                f"💰 Gestão:",
-                f"• Valor: ${sinal['risco']['valor_risco']:.2f}",
-                f"• Stop Loss: ${sinal['risco']['stop_loss']:.2f}",
-                f"• Take Profit: ${sinal['risco']['take_profit']:.2f}"
-            ]
-            
-            return "\n".join(mensagem)
-            
-        except Exception as e:
-            self.logger.error(f"{Fore.RED}Erro ao formatar mensagem Telegram: {str(e)}{Style.RESET_ALL}")
-            return ""
+   
     def _analisar_tendencia(self, dados: pd.DataFrame) -> Dict:
         """Analisa a tendência atual do ativo"""
         try:
@@ -735,26 +738,29 @@ class TradingSystem:
         print(f"Sinais detectados: {', '.join(sinal['sinais'])}")
         print("-"*50)
 
-    def registrar_sinal(self, ativo, sinal, timing, assertividade, risco):
+    def registrar_sinal(self, ativo: str, direcao: str, momento_entrada: datetime,
+                       tempo_expiracao: int, score: float, assertividade: float,
+                       padroes: List, indicadores: Dict, ml_prob: float,
+                       volatilidade: float):
         """Registra o sinal no banco de dados"""
         self.db.registrar_sinal(
             ativo=ativo,
-            direcao=sinal['direcao'],
-            momento_entrada=timing['momento_ideal'],
-            tempo_expiracao=self.config.get('trading.tempo_expiracao_padrao'),
-            score=sinal['forca_sinal'],
+            direcao=direcao,
+            momento_entrada=momento_entrada,
+            tempo_expiracao=tempo_expiracao,
+            score=score,
             assertividade=assertividade,
-            padroes=sinal['sinais'],
-            indicadores=sinal.get('indicadores', {}),
-            ml_prob=sinal.get('probabilidade', 0),
-            volatilidade=sinal.get('volatilidade', 0)
+            padroes=padroes,
+            indicadores=indicadores,
+            ml_prob=ml_prob,
+            volatilidade=volatilidade
         )
 
-    def executar(self):
+    async def executar(self):
         """Loop principal do sistema"""
         try:
             print(f"\n{Fore.CYAN}Iniciando sequência de inicialização...{Style.RESET_ALL}")
-            
+
             # Inicializa modelos e dados históricos
             print(f"\n{Fore.YELLOW}Fase 1: Baixando dados históricos...{Style.RESET_ALL}")
             self.baixar_dados_historicos()
@@ -765,12 +771,11 @@ class TradingSystem:
             self.ml_predictor.treinar(self.db.get_dados_treino())
             
             print(f"\n{Fore.GREEN}Sistema pronto! Iniciando primeira análise...{Style.RESET_ALL}")
-            
-            # Faz primeira análise imediatamente
-            self.analisar_mercado()
-            
-            # Agenda análises regulares
-            schedule.every(30).seconds.do(self.analisar_mercado)
+
+            # Loop principal assíncrono
+            while True:
+                await self.analisar_mercado()
+                await asyncio.sleep(30)  # Espera 30 segundos
             
             print(f"\n{Fore.GREEN}Sistema em execução contínua. Pressione Ctrl+C para encerrar.{Style.RESET_ALL}")
             print(f"Próxima análise em 30 segundos...")
@@ -787,5 +792,11 @@ class TradingSystem:
 
 if __name__ == "__main__":
     init()  # Inicializa colorama
+    
     sistema = TradingSystem()
-    sistema.executar()
+    
+    try:
+        asyncio.run(sistema.executar())
+    except KeyboardInterrupt:
+        print("Sistema encerrado pelo usuário")
+    

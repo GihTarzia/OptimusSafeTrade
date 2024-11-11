@@ -124,7 +124,7 @@ notificacoes:
   telegram:
     ativo: false
     token: '7906357537:AAHIU7JotNw2bQ46cSnruCtRmC65DCTAGvQ'
-    chat_id: '-4561526671'
+    chat_id: '-4553323317'
     eventos:
       - 'entrada'
       - 'saida'

@@ -22,6 +22,29 @@ class DatabaseManager:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             
+            # Tabela de métricas de mercado
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS metricas_mercado (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ativo TEXT NOT NULL,
+                    timestamp DATETIME NOT NULL,
+                    volatilidade REAL,
+                    score_mercado REAL,
+                    range_medio REAL,
+                    tendencia_definida REAL,
+                    movimento_consistente REAL,
+                    lateralizacao REAL,
+                    detalhes TEXT,
+                    UNIQUE(ativo, timestamp)
+                )
+            ''')
+
+            # Cria índice para melhor performance
+            cursor.execute('''
+                      CREATE INDEX IF NOT EXISTS idx_metricas_mercado_ativo_timestamp 
+                ON metricas_mercado(ativo, timestamp)
+            ''')
+
             # Tabela de sinais
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS sinais (
@@ -172,6 +195,78 @@ class DatabaseManager:
         
         with self.get_connection() as conn:
             return pd.read_sql_query(query, conn, params=(ativo,))
+
+    def get_metricas_mercado(self, ativo: str, periodo: str = '1d') -> pd.DataFrame:
+        """Recupera métricas históricas de mercado"""
+        query = '''
+            SELECT *
+            FROM metricas_mercado
+            WHERE ativo = ?
+            AND timestamp >= datetime('now', ?)
+            ORDER BY timestamp DESC
+        '''
+        
+        with self.get_connection() as conn:
+            return pd.read_sql_query(
+                query, 
+                conn, 
+                params=(ativo, f'-{periodo}'),
+                parse_dates=['timestamp']
+            )
+    
+    def get_resumo_metricas_mercado(self, ativo: str, periodo: str = '1d') -> Dict:
+        """Retorna resumo estatístico das métricas de mercado"""
+        df = self.get_metricas_mercado(ativo, periodo)
+        if df.empty:
+            return {}
+            
+        return {
+            'score_medio': df['score_mercado'].mean(),
+            'volatilidade_media': df['volatilidade'].mean(),
+            'score_min': df['score_mercado'].min(),
+            'score_max': df['score_mercado'].max(),
+            'periodos_favoraveis': (df['score_mercado'] >= 0.75).sum(),
+            'total_periodos': len(df),
+            'qualidade_geral': (df['score_mercado'] >= 0.75).mean() * 100
+        }
+
+    def registrar_metricas_mercado(self, ativo: str, metricas: Dict):
+        """Registra métricas de mercado para análise posterior"""
+        with self.lock:
+            try:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
+
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO metricas_mercado (
+                            ativo,
+                            timestamp,
+                            volatilidade,
+                            score_mercado,
+                            range_medio,
+                            tendencia_definida,
+                            movimento_consistente,
+                            lateralizacao,
+                            detalhes
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        ativo,
+                        metricas['timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
+                        metricas.get('volatilidade', 0),
+                        metricas.get('score_mercado', 0),
+                        metricas.get('range_medio', 0),
+                        metricas.get('tendencia_definida', 0),
+                        metricas.get('movimento_consistente', 0),
+                        metricas.get('lateralizacao', 0),
+                        json.dumps(metricas.get('detalhes', {}))
+                    ))
+
+                    conn.commit()
+
+            except Exception as e:
+                self.logger.error(f"Erro ao registrar métricas de mercado: {str(e)}")
+
+
 
     def get_dados_treino(self) -> pd.DataFrame:
         """Recupera dados para treino do modelo ML"""

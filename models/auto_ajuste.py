@@ -50,7 +50,7 @@ class AutoAjuste:
     def otimizar_parametros(self) -> ResultadoOtimizacao:
         """Realiza otimização completa dos parâmetros"""
         try:
-            self.logger.info("Iniciando otimização de parâmetros...")
+            print("Iniciando otimização de parâmetros...")
             
             # Obtém dados históricos
             dados = self.db.get_dados_treino()
@@ -200,7 +200,7 @@ class AutoAjuste:
             for param, valor in otimizacao.parametros.items():
                 self.config.set(f'analise.{param}', valor)
             
-            self.logger.info("Parâmetros atualizados com sucesso")
+            print("Parâmetros atualizados com sucesso")
 
     def get_estatisticas(self) -> Dict:
         """Retorna estatísticas das otimizações"""

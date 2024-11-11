@@ -44,7 +44,7 @@ class AutoOtimizador:
     def otimizar(self, periodo_dias: int = 30) -> Optional[ResultadoOtimizacao]:
         """Executa otimização completa dos parâmetros"""
         try:
-            self.logger.info("Iniciando processo de otimização...")
+            print("Iniciando processo de otimização...")
             
             # Carrega dados históricos
             dados = self.db.get_dados_historicos(dias=periodo_dias)
@@ -162,7 +162,7 @@ class AutoOtimizador:
             if len(self.resultados_historicos) > 1:
                 ultimo_resultado = self.resultados_historicos[-2]
                 if resultado.win_rate < ultimo_resultado.win_rate * 1.05:
-                    self.logger.info("Melhoria insuficiente, mantendo parâmetros atuais")
+                    print("Melhoria insuficiente, mantendo parâmetros atuais")
                     return
 
             # Atualiza configurações
@@ -170,7 +170,7 @@ class AutoOtimizador:
                 for param, valor in params.items():
                     self.config.set(f"{categoria}.{param}", valor)
 
-            self.logger.info("Configurações atualizadas com sucesso")
+            print("Configurações atualizadas com sucesso")
 
         except Exception as e:
             self.logger.error(f"Erro ao atualizar configurações: {str(e)}")

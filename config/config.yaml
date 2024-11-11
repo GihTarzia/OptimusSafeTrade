@@ -4,14 +4,15 @@ sistema:
   auto_restart: true
   max_memoria: 1024  # MB
   backup_interval: 3600  # 1 hora
+  interface_web: true
 
 trading:
   saldo_inicial: 1000
-  risco_por_operacao: 0.02  # 2%
-  stop_diario: -0.1  # -10%
-  meta_diaria: 0.05  # 5%
+  risco_por_operacao: 0.02  # 2% do saldo por operação
+  stop_diario: -0.1  # -10% stop loss diário
+  meta_diaria: 0.05  # 5% meta diária
   max_operacoes_dia: 15
-  min_intervalo_operacoes: 300  # 5 minutos
+  min_intervalo_operacoes: 300  # 5 minutos entre operações
   tempo_expiracao_padrao: 5  # minutos
   martingale:
     ativo: false
@@ -20,49 +21,68 @@ trading:
 
 analise:
   rsi:
-    periodo: 9
-    sobrevenda: 25
+    periodo: 9  # Mais sensível para curto prazo
+    sobrevenda: 25  # Mais extremo para opções binárias
     sobrecompra: 75
   medias_moveis:
-    curta: 10
+    curta: 8   # Mais curta para reação rápida
     media: 21
     longa: 50
   bandas_bollinger:
     periodo: 14
     desvio: 2.2
-  min_score_entrada: 2.0
-  min_assertividade: 65
-  min_volatilidade: 0.001
-  max_volatilidade: 0.005
+  min_score_entrada: 0.7     # Score mínimo para entrar (0-1)
+  min_assertividade: 65.0    # Assertividade mínima (%)
+  min_volatilidade: 0.0008   # Volatilidade mínima
+  max_volatilidade: 0.004    # Volatilidade máxima
+  min_volume: 100            # Volume mínimo
+  confirmacoes_necessarias: 2 # Número mínimo de confirmações
 
 ativos:
-  forex:
+  forex:  # Pares mais líquidos e voláteis
     - 'EURUSD=X'
     - 'GBPUSD=X'
     - 'USDJPY=X'
     - 'AUDUSD=X'
+    - 'USDCHF=X'
     - 'USDCAD=X'
+    - 'EURGBP=X'
+    - 'EURJPY=X'
+    - 'EURCHF=X'
+    - 'GBPJPY=X'
+    - 'AUDJPY=X'
     - 'NZDUSD=X'
-  indices:
-    - '^GSPC'  # S&P 500
-    - '^DJI'   # Dow Jones
-    - '^IXIC'  # NASDAQ
-  commodities:
-    - 'GC=F'   # Ouro
-    - 'CL=F'   # Petróleo
-    - 'SI=F'   # Prata
+    - 'EURAUD=X'
+    - 'AUDCHF=X'
+    - 'GBPCHF=X'
+    - 'CHFJPY=X'
+    - 'CADJPY=X'
+    - 'NZDJPY=X'
+    - 'GBPCAD=X'
+    - 'AUDNZD=X'
+    - 'EURCAD=X'
+    - 'EURNZD=X'
+    - 'NZDCAD=X'
+    - 'GBPAUD=X'
+    - 'AUDCAD=X'
 
 horarios:
   inicio_operacoes: '09:00'
   fim_operacoes: '17:00'
   horarios_bloqueados:
     - '12:00-13:00'  # Horário de almoço
+    - '15:00-15:30'  # Horário de alta volatilidade (abertura NY)
   dias_operacionais:
     - 'Monday'
     - 'Tuesday'
     - 'Wednesday'
     - 'Thursday'
     - 'Friday'
+  horarios_preferenciais:  # Horários com melhor performance histórica
+    - '09:30-11:30'
+    - '13:30-15:00'
+    - '15:30-16:30'
+
 
 ml_config:
   treino_automatico: true
@@ -73,25 +93,32 @@ ml_config:
   max_depth: 5
   learning_rate: 0.05
   n_estimators: 200
+  min_accuracy: 0.55  # Acurácia mínima para aceitar modelo
 
 filtros:
   tendencia:
-    min_inclinacao: 0.001
-    periodo_analise: 20
+    min_inclinacao: 0.001  # Inclinação mínima para considerar tendência
+    periodo_analise: 20    # Períodos para análise de tendência
   volume:
-    min_volume: 1000
-    multiplicador_media: 1.5
+    min_volume: 1000       # Volume mínimo
+    multiplicador_media: 1.5  # Multiplicador da média de volume
   spread:
-    max_spread: 0.0003
+    max_spread: 0.0003     # Spread máximo aceitável
+  momentum:
+    min_forca: 0.6        # Força mínima do momentum
+    max_forca: 0.9        # Força máxima do momentum
+
 
 indicadores_personalizados:
-  pesos:
+  pesos:  # Pesos para cada indicador na análise final
     rsi: 2.0
     medias_moveis: 1.5
     bollinger: 1.8
     volume: 1.0
     tendencia: 2.0
     padrao_candlestick: 1.2
+    momentum: 1.5
+    volatilidade: 1.3
 
 notificacoes:
   telegram:
@@ -103,3 +130,18 @@ notificacoes:
       - 'saida'
       - 'erro'
       - 'stop_diario'
+
+logs:
+  nivel: 'INFO'  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  rotacao: 7     # Dias para manter logs
+  backup: true   # Fazer backup dos logs
+  metricas: true # Registrar métricas detalhadas
+
+interface:
+  porta: 5000
+  atualizar_automatico: true
+  intervalo_atualizacao: 5  # segundos
+  mostrar_graficos: true
+  temas:
+    padrao: 'dark'
+    alternativo: 'light'

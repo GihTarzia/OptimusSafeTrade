@@ -11,16 +11,57 @@ import warnings
 warnings.filterwarnings('ignore')
 
 class MLPredictor:
-    def __init__(self, logger):
-        self.model = None
-        self.logger = logger
-        self.scaler = StandardScaler()
-        self.min_probabilidade = 0.65  # Probabilidade mínima para considerar um sinal
-        self.janela_analise = 20  # Períodos para análise
-        self.features_importance = {}
+    def __init__(self):
+        self.models = {}  # Dicionário para armazenar modelos por ativo
+        self.scalers = {}  # Dicionário para armazenar scalers por ativo
+        self.min_probabilidade = 0.65
+        self.min_accuracy = 0.55  # Mínimo de acurácia aceitável
+        
+        # Parâmetros otimizados por tipo de ativo
+        self.parametros_modelo = {
+            'forex': {
+                'max_depth': 6,
+                'learning_rate': 0.03,
+                'n_estimators': 300,
+                'min_child_weight': 3,
+                'subsample': 0.8,
+                'colsample_bytree': 0.8,
+                'objective': 'binary:logistic',
+                'random_state': 42
+            },
+            'indices': {
+                'max_depth': 4,
+                'learning_rate': 0.05,
+                'n_estimators': 400,
+                'min_child_weight': 5,
+                'subsample': 0.7,
+                'colsample_bytree': 0.7,
+                'objective': 'binary:logistic',
+                'random_state': 42
+            },
+            'commodities': {
+                'max_depth': 5,
+                'learning_rate': 0.04,
+                'n_estimators': 350,
+                'min_child_weight': 4,
+                'subsample': 0.75,
+                'colsample_bytree': 0.75,
+                'objective': 'binary:logistic',
+                'random_state': 42
+            }
+        }
+
+    def _get_modelo_params(self, ativo):
+        """Retorna parâmetros específicos para cada tipo de ativo"""
+        if any(par in ativo for par in ['USD', 'EUR', 'GBP', 'JPY', 'AUD', 'NZD', 'CAD']):
+            return self.parametros_modelo['forex']
+        elif any(indice in ativo for indice in ['^GSPC', '^DJI', '^IXIC']):
+            return self.parametros_modelo['indices']
+        else:
+            return self.parametros_modelo['commodities']
 
     def criar_features(self, df):
-        """Cria features para o modelo de ML"""
+        """Cria features para o modelo ML"""
         try:
             features = pd.DataFrame()
             
@@ -33,12 +74,22 @@ class MLPredictor:
             macd = ta.trend.MACD(df['Close'])
             features['macd'] = macd.macd()
             features['macd_signal'] = macd.macd_signal()
+            features['macd_diff'] = macd.macd_diff()
             
             # Bollinger Bands
             bollinger = ta.volatility.BollingerBands(df['Close'])
             features['bb_high'] = bollinger.bollinger_hband()
             features['bb_low'] = bollinger.bollinger_lband()
             features['bb_position'] = bollinger.bollinger_pband()
+            
+            # Médias móveis exponenciais
+            features['ema_9'] = ta.trend.EMAIndicator(df['Close'], window=9).ema_indicator()
+            features['ema_21'] = ta.trend.EMAIndicator(df['Close'], window=21).ema_indicator()
+            
+            # Ichimoku Cloud
+            ichimoku = ta.trend.IchimokuIndicator(df['High'], df['Low'])
+            features['ichimoku_a'] = ichimoku.ichimoku_a()
+            features['ichimoku_b'] = ichimoku.ichimoku_b()
             
             # Estocástico
             stoch = ta.momentum.StochasticOscillator(df['High'], df['Low'], df['Close'])
@@ -48,6 +99,8 @@ class MLPredictor:
             # ADX
             adx = ta.trend.ADXIndicator(df['High'], df['Low'], df['Close'])
             features['adx'] = adx.adx()
+            features['adx_pos'] = adx.adx_pos()
+            features['adx_neg'] = adx.adx_neg()
             
             # Volatilidade
             atr = ta.volatility.AverageTrueRange(df['High'], df['Low'], df['Close'])
@@ -59,6 +112,15 @@ class MLPredictor:
             # Volume
             if 'Volume' in df.columns and df['Volume'].sum() > 0:
                 features['volume_change'] = df['Volume'].pct_change()
+                features['volume_ema'] = ta.trend.EMAIndicator(df['Volume'], window=20).ema_indicator()
+            
+            # Fibonacci Retracement levels
+            max_price = df['High'].rolling(window=20).max()
+            min_price = df['Low'].rolling(window=20).min()
+            diff = max_price - min_price
+            features['fib_236'] = (df['Close'] - (min_price + diff * 0.236)) / df['Close']
+            features['fib_382'] = (df['Close'] - (min_price + diff * 0.382)) / df['Close']
+            features['fib_618'] = (df['Close'] - (min_price + diff * 0.618)) / df['Close']
             
             # Tendências
             for periodo in [5, 10, 20]:
@@ -71,74 +133,135 @@ class MLPredictor:
             
             print(f"Features criadas: {features.shape[1]} indicadores")
             return features
-                
+            
         except Exception as e:
             print(f"Erro ao criar features: {str(e)}")
-            return None        
- 
+            return None
+
+    def atualizar_modelo(self, ativo: str, novos_dados: pd.DataFrame):
+        """Atualiza o modelo com novos dados mantendo o aprendizado"""
+        try:
+            print(f"\nAtualizando modelo para {ativo}...")
+            
+            if ativo not in self.models:
+                print(f"Modelo não existe para {ativo} - criando novo modelo")
+                return self.treinar(novos_dados)
+    
+            # Prepara novos dados
+            features = self.criar_features(novos_dados)
+            if features is None:
+                print("Erro ao criar features para atualização")
+                return False
+    
+            # Remove registros com dados faltantes
+            valid_idx = ~features.isnull().any(axis=1)
+            features = features[valid_idx]
+            
+            # Cria labels (1 para alta, 0 para baixa)
+            retornos_futuros = novos_dados['close'].pct_change().shift(-1)
+            labels = (retornos_futuros > 0).astype(int)
+            labels = labels[valid_idx]
+            
+            if len(features) < 50:  # Mínimo de dados para atualização
+                print("Dados insuficientes para atualização")
+                return False
+    
+            # Normaliza features usando o scaler existente
+            features_scaled = self.scalers[ativo].transform(features)
+            
+            # Atualiza o modelo (partial_fit)
+            modelo_atual = self.models[ativo]['model']
+            
+            # XGBoost não suporta partial_fit, então vamos retreinar com um conjunto maior
+            modelo_atual.fit(
+                features_scaled,
+                labels,
+                xgb_model=modelo_atual.get_booster(),  # Usa o modelo existente como base
+                eval_set=[(features_scaled, labels)],
+                eval_metric='logloss',
+                early_stopping_rounds=20,
+                verbose=False
+            )
+    
+            # Avalia performance após atualização
+            predicoes = modelo_atual.predict(features_scaled)
+            accuracy_atual = (predicoes == labels).mean()
+            
+            print(f"Modelo atualizado - Acurácia atual: {accuracy_atual:.2%}")
+            
+            # Atualiza métricas do modelo
+            self.models[ativo].update({
+                'accuracy': accuracy_atual,
+                'ultima_atualizacao': datetime.now()
+            })
+    
+            return True
+    
+        except Exception as e:
+            print(f"Erro ao atualizar modelo: {str(e)}")
+            return False
+
+
+
     def treinar(self, dados_historicos):
         """Treina o modelo de ML"""
         try:
             print("\nIniciando treinamento do modelo ML...")
-
+            
             if dados_historicos.empty:
                 print("Sem dados históricos suficientes para treino")
                 return False
 
             print(f"Total de dados recebidos: {len(dados_historicos)} registros")
-
-            # Dicionário para armazenar modelos por ativo
-            self.models = {}
-
+            
             # Treina um modelo para cada ativo
             for ativo in dados_historicos['ativo'].unique():
                 print(f"\n{Fore.CYAN}Treinando modelo para {ativo}{Style.RESET_ALL}")
                 dados_ativo = dados_historicos[dados_historicos['ativo'] == ativo].copy()
-
+                
                 if len(dados_ativo) < 100:
                     print(f"Dados insuficientes para {ativo} ({len(dados_ativo)} registros)")
                     continue
-
+                    
                 # Organiza os dados por timestamp
                 dados_ativo = dados_ativo.sort_values('timestamp')
-
+                
                 # Cria features
                 print("Criando features...")
                 features = self.criar_features(dados_ativo)
                 if features is None:
                     print(f"Erro ao criar features para {ativo}")
                     continue
-
+                    
                 # Remove registros com dados faltantes
                 valid_idx = ~features.isnull().any(axis=1)
                 features = features[valid_idx]
-
+                
                 # Cria labels (1 para alta, 0 para baixa)
                 retornos_futuros = dados_ativo['Close'].pct_change().shift(-1)
                 labels = (retornos_futuros > 0).astype(int)
                 labels = labels[valid_idx]
-
+                
                 print(f"Features criadas: {len(features)} registros")
-
+                
                 # Divide dados em treino e teste
                 X_train, X_test, y_train, y_test = train_test_split(
                     features, labels, test_size=0.2, random_state=42
                 )
-
-                # Normaliza features
-                X_train_scaled = self.scaler.fit_transform(X_train)
-                X_test_scaled = self.scaler.transform(X_test)
-
+                
+                # Cria e salva scaler para este ativo
+                scaler = StandardScaler()
+                X_train_scaled = scaler.fit_transform(X_train)
+                X_test_scaled = scaler.transform(X_test)
+                self.scalers[ativo] = scaler
+                
                 print("Treinando modelo...")
+                # Obtém parâmetros específicos para o tipo de ativo
+                params = self._get_modelo_params(ativo)
+                
                 # Treina modelo
-                model = XGBClassifier(
-                    max_depth=5,
-                    learning_rate=0.05,
-                    n_estimators=200,
-                    objective='binary:logistic',
-                    random_state=42
-                )
-
+                model = XGBClassifier(**params)
+                
                 model.fit(
                     X_train_scaled,
                     y_train,
@@ -147,34 +270,38 @@ class MLPredictor:
                     early_stopping_rounds=20,
                     verbose=False
                 )
-
+                
                 # Avalia modelo
                 y_pred = model.predict(X_test_scaled)
                 accuracy = (y_pred == y_test).mean()
-
-                print(f"{Fore.GREEN}Modelo treinado para {ativo}")
-                print(f"Acurácia: {accuracy:.2%}{Style.RESET_ALL}")
-
-                # Salva modelo
-                self.models[ativo] = {
-                    'model': model,
-                    'scaler': self.scaler,
-                    'accuracy': accuracy,
-                    'features': features.columns.tolist()
-                }
-
+                
+                if accuracy >= self.min_accuracy:
+                    print(f"{Fore.GREEN}Modelo treinado para {ativo}")
+                    print(f"Acurácia: {accuracy:.2%}{Style.RESET_ALL}")
+                    
+                    # Salva modelo
+                    self.models[ativo] = {
+                        'model': model,
+                        'features': features.columns.tolist(),
+                        'accuracy': accuracy,
+                        'params': params
+                    }
+                else:
+                    print(f"{Fore.RED}Modelo rejeitado para {ativo} - Acurácia insuficiente: {accuracy:.2%}{Style.RESET_ALL}")
+            
+            modelos_validos = len(self.models)
             print(f"\n{Fore.GREEN}Treinamento concluído!")
-            print(f"Modelos treinados: {len(self.models)}{Style.RESET_ALL}")
-            return True
-
+            print(f"Modelos treinados e aceitos: {modelos_validos}{Style.RESET_ALL}")
+            return modelos_validos > 0
+                
         except Exception as e:
             print(f"{Fore.RED}Erro durante o treinamento: {str(e)}{Style.RESET_ALL}")
             return False
 
-    def prever(self, dados):
-        """Faz previsões com o modelo treinado"""
+    def prever(self, dados, ativo):
+        """Faz previsões para um ativo específico"""
         try:
-            if self.model is None:
+            if ativo not in self.models:
                 return None
                 
             # Prepara features
@@ -182,39 +309,32 @@ class MLPredictor:
             if features is None or features.empty:
                 return None
                 
+            # Seleciona apenas as features usadas no treino
+            features = features[self.models[ativo]['features']]
+            
             # Normaliza
-            features_scaled = self.scaler.transform(features)
+            features_scaled = self.scalers[ativo].transform(features)
             
             # Faz previsão
-            probabilidades = self.model.predict_proba(features_scaled)
+            model = self.models[ativo]['model']
+            probabilidades = model.predict_proba(features_scaled)
             
             # Retorna última previsão
             ultima_prob = probabilidades[-1]
             
-            # Determina direção apenas se probabilidade for alta o suficiente
             if max(ultima_prob) >= self.min_probabilidade:
                 direcao = np.argmax(ultima_prob)
                 return {
                     'direcao': 'CALL' if direcao == 1 else 'PUT',
                     'probabilidade': float(max(ultima_prob)),
-                    'confianca': self.calcular_confianca(features.iloc[-1])
+                    'score': float(max(ultima_prob)) * self.models[ativo]['accuracy']
                 }
             else:
-                return {'direcao': 'NEUTRO', 'probabilidade': 0, 'confianca': 0}
+                return {'direcao': 'NEUTRO', 'probabilidade': 0, 'score': 0}
                 
         except Exception as e:
-            print(f"Erro na previsão: {str(e)}")
+            print(f"Erro na previsão para {ativo}: {str(e)}")
             return None
-
-    def calcular_confianca(self, features_atuais):
-        """Calcula nível de confiança baseado na importância das features"""
-        confianca = 0
-        for feature, valor in features_atuais.items():
-            if feature in self.features_importance:
-                # Normaliza o valor da feature e multiplica pela sua importância
-                valor_norm = abs(float(valor)) / 100  # Normalização simples
-                confianca += valor_norm * self.features_importance[feature]
-        return min(float(confianca), 1.0)
 
     def analisar(self, ativo, periodo='1d', intervalo='5m'):
         """Realiza análise completa de um ativo"""
@@ -225,7 +345,7 @@ class MLPredictor:
                 return None
             
             # Faz previsão
-            previsao = self.prever(df)
+            previsao = self.prever(df, ativo)
             if previsao is None:
                 return None
             
@@ -241,5 +361,5 @@ class MLPredictor:
             return previsao
             
         except Exception as e:
-            print(f"Erro na análise: {str(e)}")
+            print(f"Erro na análise de {ativo}: {str(e)}")
             return None

@@ -125,7 +125,27 @@ class Config:
 
     def get_ativos_ativos(self) -> List[str]:
         """Retorna lista de todos os ativos ativos"""
-        ativos = []
-        for categoria in self.get('ativos').values():
-            ativos.extend(categoria)
-        return ativos
+        try:
+            ativos = self.config.get('ativos', {})
+            if not ativos:
+                # Lista padrão se não houver configuração
+                return [
+                    "EURUSD=X",
+                    "GBPUSD=X",
+                    "USDJPY=X",
+                    "AUDUSD=X",
+                    "USDCAD=X",
+                    "NZDUSD=X"
+                ]
+                
+            todos_ativos = []
+            for categoria in ativos.values():
+                if isinstance(categoria, list):
+                    todos_ativos.extend(categoria)
+            
+            return todos_ativos
+            
+        except Exception as e:
+            print(f"Erro ao obter lista de ativos: {str(e)}")
+            # Retorna lista mínima em caso de erro
+            return ["EURUSD=X", "GBPUSD=X"]

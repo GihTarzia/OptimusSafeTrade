@@ -14,8 +14,8 @@ class MLPredictor:
     def __init__(self):
         self.models = {}  # Dicionário para armazenar modelos por ativo
         self.scalers = {}  # Dicionário para armazenar scalers por ativo
-        self.min_probabilidade = 0.65
-        self.min_accuracy = 0.55  # Mínimo de acurácia aceitável
+        self.min_probabilidade = 0.60
+        self.min_accuracy = 0.52  # Mínimo de acurácia aceitável
         
         # Parâmetros otimizados por tipo de ativo
         self.parametros_modelo = {
@@ -64,6 +64,10 @@ class MLPredictor:
         """Cria features para o modelo ML"""
         try:
             features = pd.DataFrame()
+            
+            if len(df) < 50:  # Verifica se há dados suficientes
+                print(f"Dados insuficientes: {len(df)} registros (mínimo: 50)")
+                return None
             
             print("Calculando indicadores técnicos...")
             
@@ -201,84 +205,78 @@ class MLPredictor:
             print(f"Erro ao atualizar modelo: {str(e)}")
             return False
 
-
-
     def treinar(self, dados_historicos):
         """Treina o modelo de ML"""
         try:
             print("\nIniciando treinamento do modelo ML...")
-            
-            if dados_historicos.empty:
-                print("Sem dados históricos suficientes para treino")
-                return False
 
-            print(f"Total de dados recebidos: {len(dados_historicos)} registros")
+            if dados_historicos is None or dados_historicos.empty:
+                print("Sem dados históricos para treino")
+                return False
             
-            # Treina um modelo para cada ativo
+            print(f"Total de dados recebidos: {len(dados_historicos)} registros")
+
+            # Para cada ativo
             for ativo in dados_historicos['ativo'].unique():
-                print(f"\n{Fore.CYAN}Treinando modelo para {ativo}{Style.RESET_ALL}")
-                dados_ativo = dados_historicos[dados_historicos['ativo'] == ativo].copy()
-                
-                if len(dados_ativo) < 100:
-                    print(f"Dados insuficientes para {ativo} ({len(dados_ativo)} registros)")
-                    continue
+                try:
+                    print(f"\nTreinando modelo para {ativo}")
+                    dados_ativo = dados_historicos[dados_historicos['ativo'] == ativo].copy()
+
+                    if len(dados_ativo) < 50:  # Reduzido de 100
+                        print(f"Dados insuficientes para {ativo}: {len(dados_ativo)} registros")
+                        continue
+
+                    # Organiza os dados
+                    dados_ativo = dados_ativo.sort_values('timestamp')
+
+                    # Cria features
+                    features = self.criar_features(dados_ativo)
+                    if features is None:
+                        print(f"Erro ao criar features para {ativo}")
+                        continue
+
+                    # Remove registros com dados faltantes
+                    valid_idx = ~features.isnull().any(axis=1)
+                    features = features[valid_idx]
+
+                    # Cria labels
+                    retornos_futuros = dados_ativo['Close'].pct_change().shift(-1)
+                    labels = (retornos_futuros > 0).astype(int)
+                    labels = labels[valid_idx]
+
+                    if len(features) < 50:
+                        print(f"Features insuficientes para {ativo}")
+                        continue
                     
-                # Organiza os dados por timestamp
-                dados_ativo = dados_ativo.sort_values('timestamp')
-                
-                # Cria features
-                print("Criando features...")
-                features = self.criar_features(dados_ativo)
-                if features is None:
-                    print(f"Erro ao criar features para {ativo}")
-                    continue
-                    
-                # Remove registros com dados faltantes
-                valid_idx = ~features.isnull().any(axis=1)
-                features = features[valid_idx]
-                
-                # Cria labels (1 para alta, 0 para baixa)
-                retornos_futuros = dados_ativo['Close'].pct_change().shift(-1)
-                labels = (retornos_futuros > 0).astype(int)
-                labels = labels[valid_idx]
-                
-                print(f"Features criadas: {len(features)} registros")
-                
-                # Divide dados em treino e teste
-                X_train, X_test, y_train, y_test = train_test_split(
-                    features, labels, test_size=0.2, random_state=42
-                )
-                
-                # Cria e salva scaler para este ativo
-                scaler = StandardScaler()
-                X_train_scaled = scaler.fit_transform(X_train)
-                X_test_scaled = scaler.transform(X_test)
-                self.scalers[ativo] = scaler
-                
-                print("Treinando modelo...")
-                # Obtém parâmetros específicos para o tipo de ativo
-                params = self._get_modelo_params(ativo)
-                
-                # Treina modelo
-                model = XGBClassifier(**params)
-                
-                model.fit(
-                    X_train_scaled,
-                    y_train,
-                    eval_set=[(X_test_scaled, y_test)],
-                    eval_metric='logloss',
-                    early_stopping_rounds=20,
-                    verbose=False
-                )
-                
-                # Avalia modelo
-                y_pred = model.predict(X_test_scaled)
-                accuracy = (y_pred == y_test).mean()
-                
-                if accuracy >= self.min_accuracy:
-                    print(f"{Fore.GREEN}Modelo treinado para {ativo}")
-                    print(f"Acurácia: {accuracy:.2%}{Style.RESET_ALL}")
-                    
+                    # Divide dados
+                    X_train, X_test, y_train, y_test = train_test_split(
+                        features, labels, test_size=0.2, random_state=42
+                    )
+
+                    # Cria scaler
+                    scaler = StandardScaler()
+                    X_train_scaled = scaler.fit_transform(X_train)
+                    X_test_scaled = scaler.transform(X_test)
+
+                    # Treina modelo
+                    params = {
+                        'max_depth': 3,
+                        'learning_rate': 0.1,
+                        'n_estimators': 100,
+                        'subsample': 0.8,
+                        'objective': 'binary:logistic',
+                        'random_state': 42
+                    }
+
+                    model = XGBClassifier(**params)
+                    model.fit(X_train_scaled, y_train)
+
+                    # Avalia e salva sempre
+                    y_pred = model.predict(X_test_scaled)
+                    accuracy = (y_pred == y_test).mean()
+
+                    print(f"Modelo treinado para {ativo} - Acurácia: {accuracy:.2%}")
+
                     # Salva modelo
                     self.models[ativo] = {
                         'model': model,
@@ -286,57 +284,76 @@ class MLPredictor:
                         'accuracy': accuracy,
                         'params': params
                     }
-                else:
-                    print(f"{Fore.RED}Modelo rejeitado para {ativo} - Acurácia insuficiente: {accuracy:.2%}{Style.RESET_ALL}")
-            
-            modelos_validos = len(self.models)
-            print(f"\n{Fore.GREEN}Treinamento concluído!")
-            print(f"Modelos treinados e aceitos: {modelos_validos}{Style.RESET_ALL}")
-            return modelos_validos > 0
+                    self.scalers[ativo] = scaler
+
+                except Exception as e:
+                    print(f"Erro ao treinar modelo para {ativo}: {str(e)}")
+                    continue
                 
+            return len(self.models) > 0
+
         except Exception as e:
-            print(f"{Fore.RED}Erro durante o treinamento: {str(e)}{Style.RESET_ALL}")
+            print(f"Erro durante o treinamento: {str(e)}")
             return False
 
     def prever(self, dados, ativo):
         """Faz previsões para um ativo específico"""
         try:
             if ativo not in self.models:
+                print(f"Modelo não encontrado para {ativo}")
                 return None
-                
+
             # Prepara features
             features = self.criar_features(dados)
             if features is None or features.empty:
+                print(f"Erro ao criar features para {ativo}")
                 return None
-                
-            # Seleciona apenas as features usadas no treino
-            features = features[self.models[ativo]['features']]
-            
-            # Normaliza
-            features_scaled = self.scalers[ativo].transform(features)
-            
-            # Faz previsão
-            model = self.models[ativo]['model']
-            probabilidades = model.predict_proba(features_scaled)
-            
-            # Retorna última previsão
-            ultima_prob = probabilidades[-1]
-            
-            if max(ultima_prob) >= self.min_probabilidade:
-                direcao = np.argmax(ultima_prob)
-                return {
-                    'direcao': 'CALL' if direcao == 1 else 'PUT',
-                    'probabilidade': float(max(ultima_prob)),
-                    'score': float(max(ultima_prob)) * self.models[ativo]['accuracy']
-                }
-            else:
-                return {'direcao': 'NEUTRO', 'probabilidade': 0, 'score': 0}
-                
+
+            try:
+                # Seleciona apenas as features usadas no treino
+                features = features[self.models[ativo]['features']]
+            except KeyError as e:
+                print(f"Erro nas features do modelo para {ativo}: {str(e)}")
+                return None
+
+            try:
+                # Normaliza
+                features_scaled = self.scalers[ativo].transform(features)
+            except Exception as e:
+                print(f"Erro ao normalizar features para {ativo}: {str(e)}")
+                return None
+
+            try:
+                # Faz previsão
+                model = self.models[ativo]['model']
+                probabilidades = model.predict_proba(features_scaled)
+
+                # Retorna última previsão
+                ultima_prob = probabilidades[-1]
+
+                if max(ultima_prob) >= self.min_probabilidade:
+                    direcao = np.argmax(ultima_prob)
+                    return {
+                        'direcao': 'CALL' if direcao == 1 else 'PUT',
+                        'probabilidade': float(max(ultima_prob)),
+                        'score': float(max(ultima_prob)) * self.models[ativo]['accuracy']
+                    }
+                else:
+                    return {
+                        'direcao': 'NEUTRO',
+                        'probabilidade': float(max(ultima_prob)),
+                        'score': 0
+                    }
+
+            except Exception as e:
+                print(f"Erro ao fazer previsão para {ativo}: {str(e)}")
+                return None
+
         except Exception as e:
             print(f"Erro na previsão para {ativo}: {str(e)}")
             return None
 
-    def analisar(self, ativo, periodo='1d', intervalo='5m'):
+    def analisar(self, ativo, periodo='7d', intervalo='5m'):
         """Realiza análise completa de um ativo"""
         try:
             # Baixa dados mais recentes

@@ -7,7 +7,22 @@ from typing import Dict, List, Optional, Union
 import threading
 from colorama import Fore, Style
 from pathlib import Path
+import time  # Adiciona import do time
 
+class DatabaseConnection:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.conn = None
+
+    def __enter__(self):
+        self.conn = sqlite3.connect(self.db_path, timeout=20)
+        self.conn.row_factory = sqlite3.Row
+        return self.conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            self.conn.close()
+            
 class DatabaseManager:
     def __init__(self, db_path: str = 'data/trading_bot.db'):
         # Garante que o diretório existe
@@ -16,7 +31,16 @@ class DatabaseManager:
         self.db_path = db_path
         self.lock = threading.Lock()
         self._init_database()
+        
+    def __enter__(self):
+        self.conn = sqlite3.connect(self.db_path, timeout=20)
+        self.conn.row_factory = sqlite3.Row
+        return self.conn
 
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            self.conn.close()
+            
     def _init_database(self):
         """Inicializa as tabelas do banco de dados"""
         with self.get_connection() as conn:
@@ -93,9 +117,75 @@ class DatabaseManager:
             
             conn.commit()
 
+    def fetch_all(self, query: str, params: tuple = None) -> List[Dict]:
+        """Executa uma query SELECT e retorna todos os resultados"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+                
+            # Obtém os nomes das colunas
+            columns = [description[0] for description in cursor.description]
+
+            # Converte os resultados em lista de dicionários
+            results = cursor.fetchall()
+            return [dict(zip(columns, row)) for row in results]
+            
+        except Exception as e:
+            print(f"Erro ao executar fetch_all: {str(e)}")
+            return []
+    def fetch_one(self, query: str, params: tuple = None) -> Dict:
+        """Executa uma query SELECT e retorna um resultado"""
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+                
+            # Obtém os nomes das colunas
+            columns = [description[0] for description in cursor.description]
+            
+            # Converte o resultado em dicionário
+            result = cursor.fetchone()
+            return dict(zip(columns, result)) if result else None
+            
+        except Exception as e:
+            print(f"Erro ao executar fetch_one: {str(e)}")
+                
     def get_connection(self):
-        """Retorna uma conexão com o banco de dados"""
-        return sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=20)  # Adiciona timeout
+        conn.row_factory = sqlite3.Row
+        return conn
+    
+    def execute_with_retry(self, query: str, params: tuple = None, max_retries: int = 3) -> bool:
+        """Executa uma query com retry em caso de banco travado"""
+        with self.lock:
+            for attempt in range(max_retries):
+                try:
+                    with self.get_connection() as conn:
+                        cursor = conn.cursor()
+                        if params:
+                            cursor.execute(query, params)
+                        else:
+                            cursor.execute(query)
+                        conn.commit()
+                        return True
+                except sqlite3.OperationalError as e:
+                    if "database is locked" in str(e) and attempt < max_retries - 1:
+                        time.sleep(1)  # Espera 1 segundo antes de tentar novamente
+                        continue
+                    raise
+                except Exception as e:
+                    print(f"Erro na tentativa {attempt + 1}: {str(e)}")
+                    if attempt == max_retries - 1:
+                        return False
 
     def registrar_sinal(self, ativo: str, direcao: str, momento_entrada: datetime,
                        tempo_expiracao: int, score: float, assertividade: float,
@@ -112,9 +202,9 @@ class DatabaseManager:
                             ativo, timestamp, direcao, preco_entrada,
                             tempo_expiracao, score, assertividade, padroes,
                             indicadores, ml_prob, volatilidade
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, datetime(?), ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
-                        ativo, momento_entrada, direcao,
+                        ativo, momento_entrada.strftime('%Y-%m-%d %H:%M:%S'), direcao,
                         self.get_ultimo_preco(ativo),
                         tempo_expiracao, score, assertividade,
                         json.dumps(padroes),
@@ -126,6 +216,67 @@ class DatabaseManager:
             except Exception as e:
                 print(f"Erro ao registrar sinal: {str(e)}")
                 return None
+
+    def registrar_resultado_sinal(self, sinal_id: int, resultado: str, lucro: float):
+        """Registra o resultado de um sinal"""
+        with self.lock:
+            try:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('''
+                    UPDATE sinais 
+                    SET 
+                        resultado = ?,
+                        lucro = ?
+                    WHERE id = ?
+                    ''', (resultado, lucro, sinal_id))
+                    conn.commit()
+                    return True
+
+            except Exception as e:
+                print(f"Erro ao registrar resultado: {str(e)}")
+                return False
+
+    def get_preco(self, ativo: str, momento: datetime) -> float:
+        """Busca o preço de um ativo em um determinado momento"""
+        with self.lock:
+            try:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
+                    query = """
+                    SELECT close 
+                    FROM precos 
+                    WHERE ativo = ? 
+                    AND strftime('%Y-%m-%d %H:%M:%S', timestamp) <= ? 
+                    ORDER BY timestamp DESC 
+                    LIMIT 1
+                    """
+                    momento_str = momento.strftime('%Y-%m-%d %H:%M:%S')
+                    cursor.execute(query, (ativo, momento_str))
+                    result = cursor.fetchone()
+                    return float(result[0]) if result else None
+            except Exception as e:
+                print(f"Erro ao buscar preço: {str(e)}")
+                return None
+    
+    def get_sinais_sem_resultado(self):
+        """Busca sinais sem resultado registrado"""
+        with self.lock:
+            try:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
+                    query = """
+                    SELECT * FROM sinais 
+                    WHERE resultado IS NULL 
+                    AND timestamp < datetime('now')
+                    """
+                    cursor.execute(query)
+                    columns = [description[0] for description in cursor.description]
+                    results = cursor.fetchall()
+                    return [dict(zip(columns, row)) for row in results]
+            except Exception as e:
+                print(f"Erro ao buscar sinais sem resultado: {str(e)}")
+                return []
 
     def atualizar_resultado_sinal(self, sinal_id: int, resultado: str, lucro: float):
         """Atualiza o resultado de um sinal"""

@@ -149,21 +149,21 @@ class TradingSystem:
             # Componentes da assertividade
             prob_ml = sinal.get('ml_prob', 0)
             forca_padroes = sinal.get('padroes_força', 0)
-            historico = self.db.get_assertividade_recente(ativo, sinal['direcao'])
+            historico = self.db.get_assertividade_recente(ativo, sinal['direcao']) or 50
             volatilidade_ok = 0.001 <= sinal.get('volatilidade', 0) <= 0.005
             
             # Pesos
-            peso_ml = 0.4
-            peso_padroes = 0.3
-            peso_historico = 0.2
-            peso_volatilidade = 0.1
+            peso_ml = 0.45
+            peso_padroes = 0.35
+            peso_historico = 0.10
+            peso_volatilidade = 0.10
             
             # Cálculo ponderado
             assertividade = (
                 prob_ml * peso_ml +
                 forca_padroes * peso_padroes +
                 (historico/100) * peso_historico +
-                (1 if volatilidade_ok else 0) * peso_volatilidade
+                (1 if volatilidade_ok else 0.5) * peso_volatilidade
             ) * 100
             
             print(f"Componentes da assertividade:")
@@ -311,11 +311,20 @@ class TradingSystem:
                     continue
                 if sinal_ml:
                     print(f"Sinal ML obtido - Direção: {sinal_ml.get('direcao')} - Prob: {sinal_ml.get('probabilidade', 0):.2%}")
-          
+                if not sinal_ml or sinal_ml.get('direcao') == 'NEUTRO':
+                    print(f"{Fore.YELLOW}Sem sinal ou sinal neutro para {ativo}{Style.RESET_ALL}")
+                    continue
                 
                 # Análise de padrões
                 dados_mercado = self.db.get_dados_mercado(ativo, limite=100)
+                if dados_mercado is None or dados_mercado.empty:
+                    print(f"{Fore.YELLOW}Sem dados de mercado para {ativo}{Style.RESET_ALL}")
+                    continue
+
                 analise_padroes = self.analise_padroes.analisar(ativo)
+                if not analise_padroes:
+                    print(f"{Fore.YELLOW}Sem padrões detectados para {ativo}{Style.RESET_ALL}")
+                    continue
 
                 # Avalia condições do mercado
                 condicoes = self._avaliar_condicoes_mercado(ativo, dados_mercado)
@@ -342,7 +351,12 @@ class TradingSystem:
                 if not sinal_combinado:
                     print(f"{Fore.YELLOW}Sem sinal combinado para {ativo}{Style.RESET_ALL}")
                     continue
-                
+                        
+                # Verifica direção final antes de notificar
+                if sinal_combinado['direcao'] == 'NEUTRO':
+                    print(f"{Fore.YELLOW}Sinal final neutro para {ativo}{Style.RESET_ALL}")
+                    continue
+        
                 if sinal_combinado['score'] >= self.config.get('analise.min_score_entrada', 0.7):
                     print(f"Score suficiente: {sinal_combinado['score']:.2%} >= {self.config.get('analise.min_score_entrada', 0.7):.2%}")
 
@@ -459,46 +473,39 @@ class TradingSystem:
                 print(f"\n{Fore.MAGENTA}Direções não definidas{Style.RESET_ALL}")
                 return None
             
-            # Score base (média ponderada)
-            score_ml = sinal_ml.get('probabilidade', 0) * 0.4  # 40% peso
-            score_padroes = analise_padroes.get('forca_sinal', 0) * 0.4  # 40% peso
-            
             # Análise de tendência
             tendencia = self._analisar_tendencia(dados_mercado)
-            score_tendencia = tendencia.get('forca', 0) * 0.2  # 20% peso
             
-            print(f"Scores parciais:")
-            print(f"ML: {score_ml:.2%}")
-            print(f"Padrões: {score_padroes:.2%}")
-            print(f"Tendência: {score_tendencia:.2%}")
-            
-            # Score final
+            # Score base (média ponderada)
+            score_ml = min(sinal_ml.get('probabilidade', 0) * 0.7, 0.7)  # Limita em 70%
+            score_padroes = min(analise_padroes.get('forca_sinal', 0) * 0.2, 0.2)  # Limita em 20%
+            score_tendencia = min(tendencia.get('forca', 0) * 0.1, 0.1)  # Limita em 10%
+                    
+            # Score inicial
             score_final = score_ml + score_padroes + score_tendencia
-            
-            # Determina direção final
+
+            # Bônus com limitadores
             if direcao_ml == direcao_padroes:
-                direcao_final = direcao_ml
-                score_final *= 1.2  # Bônus por concordância
-                print(f"Bônus de concordância aplicado")
-            else:
-                # Se direções diferentes, usa a mais forte
-                direcao_final = direcao_ml if score_ml > score_padroes else direcao_padroes
-                score_final *= 0.8  # Penalidade por divergência
-                print(f"Penalidade por divergência aplicada")
-            
-            # Ajusta score pela tendência
-            if tendencia['direcao'] == direcao_final:
-                score_final *= 1.1  # Bônus por seguir tendência
-                print(f"Bônus de tendência aplicado")
-            
-            score_final = min(score_final, 1.0)  # Limita a 1.0
-            
-            print(f"Score final: {score_final:.2%}")
-            print(f"Direção final: {direcao_final}")
+                score_final = min(score_final * 1.5, 1.0)
+
+            if tendencia['direcao'] == direcao_ml:
+                score_final = min(score_final * 1.3, 1.0)
+
+            if sinal_ml.get('probabilidade', 0) > 0.6:
+                score_final = min(score_final * 1.25, 1.0)
+
+            if analise_padroes.get('num_padroes', 0) >= 2:
+                score_final = min(score_final * 1.2, 1.0)
+
+            # Garante que o score final está entre 0 e 1
+            score_final = max(0, min(score_final, 1.0))
+
+            # Arredonda para 2 casas decimais
+            score_final = round(score_final, 2)
             
             return {
                 'ativo': ativo,
-                'direcao': direcao_final,
+                'direcao': direcao_ml,
                 'score': score_final,
                 'ml_prob': sinal_ml.get('probabilidade', 0),
                 'padroes_força': analise_padroes.get('forca_sinal', 0),
@@ -635,29 +642,19 @@ class TradingSystem:
             close = dados['close']
             ema9 = ta.trend.EMAIndicator(close, window=9).ema_indicator()
             ema21 = ta.trend.EMAIndicator(close, window=21).ema_indicator()
-            ema50 = ta.trend.EMAIndicator(close, window=50).ema_indicator()
             
-            # Verifica se temos dados suficientes
-            if ema50.isna().any():
-                return {'direcao': 'NEUTRO', 'forca': 0}
+            # Inclinação das médias
+            inclinacao_9 = (ema9.iloc[-1] - ema9.iloc[-5]) / ema9.iloc[-5]
+            inclinacao_21 = (ema21.iloc[-1] - ema21.iloc[-5]) / ema21.iloc[-5]
             
-            # Verifica alinhamento das médias
-            ultimo_ema9 = ema9.iloc[-1]
-            ultimo_ema21 = ema21.iloc[-1]
-            ultimo_ema50 = ema50.iloc[-1]
-            ultimo_preco = close.iloc[-1]
+            forca = abs(inclinacao_9) * 2  # Dobra a força da tendência
             
-            # Determina direção e força
-            if ultimo_ema9 > ultimo_ema21 > ultimo_ema50 and ultimo_preco > ultimo_ema9:
-                return {'direcao': 'CALL', 'forca': 1.0}
-            elif ultimo_ema9 < ultimo_ema21 < ultimo_ema50 and ultimo_preco < ultimo_ema9:
-                return {'direcao': 'PUT', 'forca': 1.0}
-            elif ultimo_ema9 > ultimo_ema21:
-                return {'direcao': 'CALL', 'forca': 0.7}
-            elif ultimo_ema9 < ultimo_ema21:
-                return {'direcao': 'PUT', 'forca': 0.7}
+            if inclinacao_9 > 0 and inclinacao_21 > 0:
+                return {'direcao': 'CALL', 'forca': min(forca * 1.5, 1.0)}
+            elif inclinacao_9 < 0 and inclinacao_21 < 0:
+                return {'direcao': 'PUT', 'forca': min(forca * 1.5, 1.0)}
             else:
-                return {'direcao': 'NEUTRO', 'forca': 0.5}
+                return {'direcao': 'NEUTRO', 'forca': 0}
                     
         except Exception as e:
             print(f"{Fore.RED}Erro ao analisar tendência: {str(e)}{Style.RESET_ALL}")
@@ -669,10 +666,14 @@ class TradingSystem:
         """Valida se o sinal atende todos os critérios mínimos"""
         try:
             # Critérios mínimos
-            min_assertividade = self.config.get('analise.min_assertividade', 65)
-            min_score = self.config.get('analise.min_score_entrada', 0.7)
-            min_taxa_horario = 0.55
+            min_assertividade = 50.0  # Era 65
+            min_score = 0.55        # Era 0.7
+            min_taxa_horario = 0.1  # Mantido
             
+            # Ranges de volatilidade mais permissivos
+            min_vol = 0.00005  # Era 0.001
+            max_vol = 0.01    # Era 0.005  
+                     
             if assertividade < min_assertividade:
                 print(f"Assertividade insuficiente: {assertividade:.1f}% (mín: {min_assertividade}%)")
                 return False
@@ -683,14 +684,6 @@ class TradingSystem:
                 
             if timing['taxa_sucesso_horario'] < min_taxa_horario:
                 print(f"Taxa de sucesso no horário insuficiente: {timing['taxa_sucesso_horario']:.1%} (mín: {min_taxa_horario:.1%})")
-                return False
-            
-            # Verifica volatilidade
-            min_vol = self.config.get('analise.min_volatilidade', 0.001)
-            max_vol = self.config.get('analise.max_volatilidade', 0.005)
-            
-            if not (min_vol <= sinal['volatilidade'] <= max_vol):
-                print(f"Volatilidade fora do range: {sinal['volatilidade']:.4f} (range: {min_vol}-{max_vol})")
                 return False
             
             print(f"{Fore.GREEN}Todos os critérios atendidos{Style.RESET_ALL}")
@@ -755,6 +748,54 @@ class TradingSystem:
             ml_prob=ml_prob,
             volatilidade=volatilidade
         )
+        
+    async def verificar_resultados(self):
+        """Verifica resultados de sinais anteriores"""
+        try:
+            sinais_pendentes = self.db.get_sinais_sem_resultado()
+
+            for sinal in sinais_pendentes:
+                # Calcula tempo decorrido
+                momento_entrada = datetime.strptime(sinal['timestamp'].split('.')[0], '%Y-%m-%d %H:%M:%S')
+                tempo_expiracao = sinal['tempo_expiracao']
+                momento_expiracao = momento_entrada + timedelta(minutes=tempo_expiracao)
+
+                if datetime.now() > momento_expiracao:
+                    # Busca preço de entrada e saída
+                    preco_entrada = self.db.get_preco(sinal['ativo'], momento_entrada)
+                    preco_saida = self.db.get_preco(sinal['ativo'], momento_expiracao)
+
+                    if preco_entrada and preco_saida:
+                        # Determina resultado
+                        if sinal['direcao'] == 'CALL':
+                            resultado = 'WIN' if preco_saida > preco_entrada else 'LOSS'
+                        else:  # PUT
+                            resultado = 'WIN' if preco_saida < preco_entrada else 'LOSS'
+
+                        # Calcula lucro/prejuízo
+                        variacao = abs(preco_saida - preco_entrada) / preco_entrada
+                        lucro = variacao * 100 if resultado == 'WIN' else -variacao * 100
+
+                        # Registra resultado
+                        if self.db.registrar_resultado_sinal(sinal['id'], resultado, lucro):
+                            print(f"Resultado registrado com sucesso")
+                            
+                            # Notifica resultado
+                            await self._notificar_resultado({
+                                'ativo': sinal['ativo'],
+                                'direcao': sinal['direcao'],
+                                'resultado': resultado,
+                                'lucro': lucro,
+                                'entrada': momento_entrada,
+                                'saida': momento_expiracao,
+                                'score': sinal['score'],
+                                'assertividade': sinal['assertividade']
+                            })
+                        else:
+                            print(f"Erro ao registrar resultado")
+
+        except Exception as e:
+            self.logger.error(f"Erro ao verificar resultados: {str(e)}")
 
     async def executar(self):
         """Loop principal do sistema"""
@@ -775,15 +816,8 @@ class TradingSystem:
             # Loop principal assíncrono
             while True:
                 await self.analisar_mercado()
+                await self.verificar_resultados()  # Adiciona verificação de resultados
                 await asyncio.sleep(30)  # Espera 30 segundos
-            
-            print(f"\n{Fore.GREEN}Sistema em execução contínua. Pressione Ctrl+C para encerrar.{Style.RESET_ALL}")
-            print(f"Próxima análise em 30 segundos...")
-            
-            # Loop principal
-            while True:
-                schedule.run_pending()
-                time.sleep(1)
                 
         except KeyboardInterrupt:
             self.logger.info("Sistema encerrado pelo usuário")

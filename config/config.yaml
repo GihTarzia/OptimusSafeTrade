@@ -31,46 +31,29 @@ analise:
   bandas_bollinger:
     periodo: 14
     desvio: 2.2
-  min_score_entrada: 0.7     # Score mínimo para entrar (0-1)
-  min_assertividade: 65.0    # Assertividade mínima (%)
-  min_volatilidade: 0.0008   # Volatilidade mínima
-  max_volatilidade: 0.004    # Volatilidade máxima
+  min_score_entrada: 0.5     # Era 0.7
+  min_assertividade: 50.0    # Era 65.0
+  min_volatilidade: 0.00005  # Era 0.001
+  max_volatilidade: 0.01     # Era 0.005
+  confirmacoes_necessarias: 2
   min_volume: 100            # Volume mínimo
-  confirmacoes_necessarias: 2 # Número mínimo de confirmações
 
 ativos:
   forex:  # Pares mais líquidos e voláteis
     - 'EURUSD=X'
+    - 'JPY=X'
     - 'GBPUSD=X'
-    - 'USDJPY=X'
-    - 'AUDUSD=X'
-    - 'USDCHF=X'
-    - 'USDCAD=X'
     - 'EURGBP=X'
     - 'EURJPY=X'
-    - 'EURCHF=X'
     - 'GBPJPY=X'
     - 'AUDJPY=X'
-    - 'NZDUSD=X'
-    - 'EURAUD=X'
-    - 'AUDCHF=X'
-    - 'GBPCHF=X'
-    - 'CHFJPY=X'
-    - 'CADJPY=X'
-    - 'NZDJPY=X'
-    - 'GBPCAD=X'
-    - 'AUDNZD=X'
-    - 'EURCAD=X'
-    - 'EURNZD=X'
-    - 'NZDCAD=X'
-    - 'GBPAUD=X'
     - 'AUDCAD=X'
 
 horarios:
   inicio_operacoes: '09:00'
-  fim_operacoes: '17:00'
+  fim_operacoes: '23:00'
   horarios_bloqueados:
-    - '12:00-13:00'  # Horário de almoço
+    #- '12:00-13:00'  # Horário de almoço
     - '15:00-15:30'  # Horário de alta volatilidade (abertura NY)
   dias_operacionais:
     - 'Monday'
@@ -124,7 +107,7 @@ notificacoes:
   telegram:
     ativo: false
     token: '7906357537:AAHIU7JotNw2bQ46cSnruCtRmC65DCTAGvQ'
-    chat_id: '-4553323317'
+    chat_id: '-1002281083879'
     eventos:
       - 'entrada'
       - 'saida'

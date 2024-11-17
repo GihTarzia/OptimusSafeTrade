@@ -19,7 +19,7 @@ class Padrao:
 class AnalisePadroesComplexos:
     def __init__(self):
         self.padroes_historico = {}
-        self.min_confiabilidade = 0.6
+        self.min_confiabilidade = 0.5
         self.periodos_analise = {
             'curto': 14,
             'medio': 28,
@@ -49,7 +49,7 @@ class AnalisePadroesComplexos:
         """Retorna configurações específicas para o tipo de ativo"""
         if any(par in ativo for par in ['USD', 'EUR', 'GBP', 'JPY', 'AUD', 'NZD', 'CAD']):
             return {
-                'volatilidade_min': 0.0001,
+                'volatilidade_min': 0.00005,
                 'volume_min': 0,  # Forex não precisa verificar volume
                 'tempo_padrao': 5
             }
@@ -229,7 +229,7 @@ class AnalisePadroesComplexos:
                 close.iloc[-1] > ema9.iloc[-1]):
                 padroes.append(Padrao(
                     nome="Tendência Forte de Alta",
-                    forca=0.9,
+                    forca=1.0,
                     direcao="CALL",
                     confiabilidade=0.85,
                     tipo="tendencia",

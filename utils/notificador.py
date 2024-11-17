@@ -68,7 +68,8 @@ class Notificador:
                 f"📊 *Qualidade do Sinal:*",
                 f"• Score: {sinal['score']:.2%}",
                 f"• Assertividade: {sinal['assertividade']:.1f}%"
-               #f"• Tendência: {sinal['tendencia']}",
+                #f"• Tendência: {sinal['tendencia']}",
+                #f"• Volatilidade: {sinal['volatilidade']:.2%}",
                #f"",
                #f"💰 *Gestão:*",
                #f"• Valor: ${sinal['risco']['valor_risco']:.2f}",
@@ -79,15 +80,8 @@ class Notificador:
             ]
             
             # Adiciona padrões detectados
-            #for padrao in s['sinais'][:3]:  # Limita a 3 padrões
+            #for padrao in sinal['sinais'][:3]:  # Limita a 3 padrões
             #    mensagem.append(f"• {padrao['nome']}")
-            #
-            #mensagem.extend([
-            #    f"",
-            #    f"🔄 *Acompanhamento:*",
-            #    f"• Volatilidade: {s['volatilidade']:.2%}",
-            #    f"• Taxa Sucesso Horário: {timing['taxa_sucesso_horario']:.1%}"
-            #])
             
             return "\n".join(mensagem)  # Corrigi aqui
             
@@ -99,17 +93,22 @@ class Notificador:
         """Formata resultado de operação para Telegram"""
         try:
             emoji = "✅" if operacao['resultado'] == 'WIN' else "❌"
-            
+            emoji_direcao = "🟢" if operacao['direcao'] == 'CALL' else "🔴"
+
             mensagem = [
                 f"{emoji} *RESULTADO {operacao['ativo']}*",
                 f"",
                 f"📈 *Operação:* {operacao['direcao']}",
                 f"💵 *Resultado:* {'Gain' if operacao['resultado'] == 'WIN' else 'Loss'}",
                 f"💰 *Lucro:* ${operacao['lucro']:.2f}",
+                f"{emoji_direcao} *SINAL {operacao['direcao']}*",
                 f"",
-                f"📊 *Estatísticas do Dia:*",
-                f"• Win Rate: {operacao['win_rate_dia']:.1f}%",
-                f"• Resultado: {operacao['resultado_dia']:+.2f}%"
+                f"⏰ *Entrada:* {operacao['entrada'].strftime('%H:%M:%S')}",
+                f"⌛️ *Expiração:* {operacao['saida']}",
+                f"",
+                f"📊 *Qualidade do Sinal:*",
+                f"• Score: {operacao['score']:.2%}",
+                f"• Assertividade: {operacao['assertividade']:.1f}%"
             ]
             
             return "\n".join(mensagem)  # Corrigi aqui

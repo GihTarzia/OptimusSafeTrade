@@ -1,30 +1,91 @@
 import logging
 from datetime import datetime
-import os
 from pathlib import Path
 import json
 import threading
 from colorama import init, Fore, Style
-from logging.handlers import RotatingFileHandler
+from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
+from typing import Dict, Optional, List
+from collections import deque
 
-init()  # Inicializa colorama
+init()
+
+class MetricsCollector:
+    """Classe para coletar e analisar métricas do sistema"""
+    def __init__(self, max_entries: int = 1000):
+        self.metrics = {
+            'operations': deque(maxlen=max_entries),
+            'errors': deque(maxlen=max_entries),
+            'performance': deque(maxlen=max_entries),
+            'system': deque(maxlen=max_entries)
+        }
+        self.lock = threading.Lock()
+
+    def add_metric(self, category: str, data: Dict):
+        """Adiciona uma nova métrica"""
+        with self.lock:
+            if category in self.metrics:
+                data['timestamp'] = datetime.now()
+                self.metrics[category].append(data)
+
+class AlertManager:
+    """Gerenciador de alertas do sistema"""
+    def __init__(self, max_alerts: int = 100):
+        self.alerts = deque(maxlen=max_alerts)
+        self.critical_alerts = deque(maxlen=max_alerts)
+        self.lock = threading.Lock()
+        self.alert_levels = {
+            'CRITICAL': 4,
+            'ERROR': 3,
+            'WARNING': 2,
+            'INFO': 1,
+            'DEBUG': 0
+        }
+
+    def add_alert(self, level: str, message: str, data: Optional[Dict] = None):
+        """Adiciona um novo alerta"""
+        with self.lock:
+            alert = {
+                'timestamp': datetime.now(),
+                'level': level,
+                'message': message,
+                'data': data
+            }
+            self.alerts.append(alert)
+            
+            if level in ['CRITICAL', 'ERROR']:
+                self.critical_alerts.append(alert)
+
+    def get_active_alerts(self, min_level: str = 'WARNING') -> List[Dict]:
+        """Retorna alertas ativos acima do nível especificado"""
+        with self.lock:
+            min_level_value = self.alert_levels.get(min_level, 0)
+            return [
+                alert for alert in self.alerts
+                if self.alert_levels.get(alert['level'], 0) >= min_level_value
+            ]
 
 class TradingLogger:
-    def __init__(self, log_dir: str = 'logs', max_files: int = 5):
+    def __init__(self, log_dir: str = 'data', max_files: int = 1000):
+        # Remove todos os handlers existentes para evitar duplicação
+        logger = logging.getLogger()
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
         self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.log_dir.mkdir(parents=True, exist_ok=True) 
         
         # Configuração básica do logger
-        self.logger = logging.getLogger('TradingBot')
+        self.logger = logging.getLogger('OpitimusSafeTrade')
         self.logger.setLevel(logging.DEBUG)
         
-        # Formato do log
+        # Formato personalizado com mais informações
         formatter = logging.Formatter(
-            '%(asctime)s - %(levelname)s - %(message)s',
+            '%(asctime)s - [%(levelname)s] - %(name)s - '
+            '%(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
         
-        # Handler para arquivo com rotação
+        # Handler para arquivo com rotação por tamanho
         file_handler = RotatingFileHandler(
             self.log_dir / 'trading_bot.log',
             maxBytes=10*1024*1024,  # 10MB
@@ -33,146 +94,108 @@ class TradingLogger:
         file_handler.setFormatter(formatter)
         self.logger.addHandler(file_handler)
         
-        # Handler para console
-        console_handler = logging.StreamHandler()
+        # Handler para arquivo com rotação diária
+        daily_handler = TimedRotatingFileHandler(
+            self.log_dir / 'trading_bot_daily.log',
+            when='midnight',
+            interval=1,
+            backupCount=30  # Mantém 30 dias
+        )
+        daily_handler.setFormatter(formatter)
+        self.logger.addHandler(daily_handler)
+        
+        # Handler para console com cores
+        console_handler = ColoredConsoleHandler()
         console_handler.setFormatter(formatter)
         self.logger.addHandler(console_handler)
         
-        # Métricas e estatísticas
-        self.metricas = {}
-        self.alertas_criticos = []
+        # Gerenciadores especializados
+        self.metrics = MetricsCollector()
+        self.alerts = AlertManager()
         self.lock = threading.Lock()
-        
-        # Níveis de alerta
-        self.niveis_alerta = {
-            'CRITICAL': {'cor': Fore.RED},
-            'ERROR': {'cor': Fore.RED},
-            'WARNING': {'cor': Fore.YELLOW},
-            'INFO': {'cor': Fore.CYAN},
-            'DEBUG': {'cor': Fore.WHITE}
+
+        # Performance monitoring
+        self.performance_data = {
+            'start_time': datetime.now(),
+            'log_counts': {level: 0 for level in logging._nameToLevel},
+            'last_error': None,
+            'error_count': 0
         }
 
-    def _log_mensagem(self, nivel: str, mensagem: str, dados: dict = None):
-        """Processa e registra uma mensagem de log"""
+    def _log_with_context(self, level: str, message: str, data: Dict = None, 
+                         context: Dict = None, alert: bool = False):
+        """Registra log com contexto adicional"""
         with self.lock:
             try:
-                # Formata a mensagem
-                msg_formatada = f"{self.niveis_alerta[nivel]['cor']}{mensagem}{Style.RESET_ALL}"
-                if dados:
-                    msg_formatada += f"\nDados: {json.dumps(dados, indent=2)}"
-                
+                # Prepara mensagem com contexto
+                full_message = message
+                if context:
+                    full_message += f"\nContext: {json.dumps(context, indent=2)}"
+                if data:
+                    full_message += f"\nData: {json.dumps(data, indent=2)}"
+
                 # Registra no logger
-                getattr(self.logger, nivel.lower())(mensagem)
+                log_func = getattr(self.logger, level.lower())
+                log_func(full_message)
+
+                # Atualiza métricas
+                self.performance_data['log_counts'][level.upper()] += 1
                 
-                # Exibe no console com cores
-                print(msg_formatada)
-                
-                # Registra métricas
-                self._registrar_metrica(nivel, mensagem, dados)
-                
+                # Registra alerta se necessário
+                if alert or level in ['CRITICAL', 'ERROR']:
+                    self.alerts.add_alert(level, message, data)
+
+                # Coleta métricas específicas
+                if level in ['CRITICAL', 'ERROR']:
+                    self.metrics.add_metric('errors', {
+                        'level': level,
+                        'message': message,
+                        'data': data
+                    })
+                    self.performance_data['last_error'] = datetime.now()
+                    self.performance_data['error_count'] += 1
+
             except Exception as e:
-                print(f"Erro ao registrar log: {str(e)}")
+                self.error(f"Erro ao registrar log: {str(e)}")
 
-    def _registrar_metrica(self, nivel: str, mensagem: str, dados: dict = None):
-        """Registra métricas para análise"""
-        timestamp = datetime.now().isoformat()
-        
-        with self.lock:
-            if nivel not in self.metricas:
-                self.metricas[nivel] = []
-                
-            metrica = {
-                'timestamp': timestamp,
-                'mensagem': mensagem,
-                'dados': dados
-            }
-            
-            self.metricas[nivel].append(metrica)
-            
-            # Mantém apenas últimas 1000 métricas por nível
-            if len(self.metricas[nivel]) > 1000:
-                self.metricas[nivel].pop(0)
-            
-            # Registra alertas críticos
-            if nivel in ['CRITICAL', 'ERROR']:
-                self.alertas_criticos.append(metrica)
-                if len(self.alertas_criticos) > 100:
-                    self.alertas_criticos.pop(0)
+    def critical(self, message: str, data: Dict = None, context: Dict = None):
+        """Registra erro crítico com alta visibilidade"""
+        self._log_with_context('CRITICAL', message, data, context, alert=True)
 
-    def critical(self, mensagem: str, dados: dict = None):
-        """Registra mensagem crítica"""
-        self._log_mensagem('CRITICAL', mensagem, dados)
+    def error(self, message: str, data: Dict = None, context: Dict = None):
+        """Registra erro com contexto"""
+        self._log_with_context('ERROR', message, data, context, alert=True)
 
-    def error(self, mensagem: str, dados: dict = None):
-        """Registra erro"""
-        self._log_mensagem('ERROR', mensagem, dados)
+    def warning(self, message: str, data: Dict = None, context: Dict = None):
+        """Registra aviso com dados adicionais"""
+        self._log_with_context('WARNING', message, data, context)
 
-    def warning(self, mensagem: str, dados: dict = None):
-        """Registra aviso"""
-        self._log_mensagem('WARNING', mensagem, dados)
+    def info(self, message: str, data: Dict = None, context: Dict = None):
+        """Registra informação com contexto"""
+        self._log_with_context('INFO', message, data, context)
 
-    def info(self, mensagem: str, dados: dict = None):
-        """Registra informação"""
-        self._log_mensagem('INFO', mensagem, dados)
+    def debug(self, message: str, data: Dict = None, context: Dict = None):
+        """Registra mensagem de debug com dados detalhados"""
+        self._log_with_context('DEBUG', message, data, context)
 
-    def debug(self, mensagem: str, dados: dict = None):
-        """Registra mensagem de debug"""
-        self._log_mensagem('DEBUG', mensagem, dados)
 
-    def registrar_operacao(self, operacao: dict):
-        """Registra detalhes de uma operação"""
-        nivel = 'INFO' if operacao.get('resultado') == 'WIN' else 'WARNING'
-        self._log_mensagem(nivel, "Nova Operação", operacao)
 
-    def registrar_erro_sistema(self, erro: Exception, contexto: dict = None):
-        """Registra erro do sistema"""
-        dados = {
-            'erro': str(erro),
-            'tipo': type(erro).__name__,
-            'contexto': contexto or {}
+class ColoredConsoleHandler(logging.StreamHandler):
+    """Handler personalizado para console com cores"""
+    def __init__(self):
+        super().__init__()
+        self.level_colors = {
+            'DEBUG': Fore.WHITE,
+            'INFO': Fore.CYAN,
+            'WARNING': Fore.YELLOW,
+            'ERROR': Fore.RED,
+            'CRITICAL': Fore.RED + Style.BRIGHT
         }
-        self._log_mensagem('ERROR', "Erro do Sistema", dados)
 
-    def get_metricas(self) -> dict:
-        """Retorna métricas acumuladas"""
-        with self.lock:
-            return {
-                'total_logs': sum(len(logs) for logs in self.metricas.values()),
-                'logs_por_nivel': {nivel: len(logs) for nivel, logs in self.metricas.items()},
-                'alertas_criticos': len(self.alertas_criticos),
-                'ultimo_alerta': self.alertas_criticos[-1] if self.alertas_criticos else None
-            }
-
-    def exportar_logs(self, caminho: str = None):
-        """Exporta logs para arquivo JSON"""
-        if not caminho:
-            caminho = self.log_dir / f'logs_export_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
-            
-        with self.lock:
-            try:
-                dados_export = {
-                    'metricas': self.metricas,
-                    'alertas_criticos': self.alertas_criticos,
-                    'export_timestamp': datetime.now().isoformat()
-                }
-                
-                with open(caminho, 'w') as f:
-                    json.dump(dados_export, f, indent=4)
-                    
-                self.info(f"Logs exportados para: {caminho}")
-                
-            except Exception as e:
-                self.error(f"Erro ao exportar logs: {str(e)}")
-
-    def limpar_logs_antigos(self, dias: int = 30):
-        """Remove logs mais antigos que X dias"""
+    def emit(self, record):
         try:
-            data_limite = datetime.now().timestamp() - (dias * 24 * 60 * 60)
-            
-            for arquivo in self.log_dir.glob('*.log.*'):
-                if arquivo.stat().st_mtime < data_limite:
-                    arquivo.unlink()
-                    self.info(f"Log antigo removido: {arquivo}")
-                    
-        except Exception as e:
-            self.error(f"Erro ao limpar logs antigos: {str(e)}")
+            color = self.level_colors.get(record.levelname, Fore.WHITE)
+            message = self.format(record)
+            print(f"{color}{message}{Style.RESET_ALL}")
+        except Exception:
+            self.handleError(record)

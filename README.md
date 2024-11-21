@@ -60,14 +60,10 @@ opitimussafetrade/
 ├── data/
 │   ├── __init__.py
 │   ├── trading_bot.db
-│   └── modelos/
-│
-├── logs/
 │   └── trading_bot.log
 │
 ├── models/
-│   ├── __init__.py--
-│   ├── auto_otimizador.py
+│   ├── __init__.py
 │   ├── ml_predictor.py
 │   ├── analise_padroes.py
 │   ├── gestao_risco.py

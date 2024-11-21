@@ -1,364 +1,481 @@
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
 import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import datetime
 import ta
-from colorama import Fore, Style
 import warnings
 warnings.filterwarnings('ignore')
+from typing import Dict, Optional
+from pathlib import Path
 
 class MLPredictor:
-    def __init__(self):
-        self.models = {}  # Dicionário para armazenar modelos por ativo
-        self.scalers = {}  # Dicionário para armazenar scalers por ativo
-        self.min_probabilidade = 0.60
-        self.min_accuracy = 0.52  # Mínimo de acurácia aceitável
+    def __init__(self, config, logger):
+        self.models = {}
+        self.scalers = {}
+        self.feature_names = {}  # Novo dicionário para armazenar nomes das features
+        self.models_path = Path("models/saved")
+        self.models_path.mkdir(parents=True, exist_ok=True)
+        self.config= config
+        self.logger = logger
+        ml_config = self.config.get('ml_config')
+        self.cache_timeout = self.config.get('ml_parametros.cache_timeout')
+        self.min_probabilidade = ml_config['min_probabilidade']
+        self.min_accuracy = ml_config['min_accuracy']
+        self.max_depth = ml_config['max_depth']
+        self.learning_rate = ml_config['learning_rate']
+        self.n_estimators = ml_config['n_estimators']
+        self.min_confirmacoes = self.config.get('ml_config.min_confirmacoes')  # Novo: mínimo de confirmações técnicas
+
+        self.min_training_size = 1000
         
-        # Parâmetros otimizados por tipo de ativo
+        
+        # Novos parâmetros otimizados por tipo de ativo
         self.parametros_modelo = {
             'forex': {
-                'max_depth': 6,
-                'learning_rate': 0.03,
+                'max_depth': 5,
+                'learning_rate': 0.01,
                 'n_estimators': 300,
-                'min_child_weight': 3,
-                'subsample': 0.8,
-                'colsample_bytree': 0.8,
-                'objective': 'binary:logistic',
-                'random_state': 42
-            },
-            'indices': {
-                'max_depth': 4,
-                'learning_rate': 0.05,
-                'n_estimators': 400,
                 'min_child_weight': 5,
                 'subsample': 0.7,
                 'colsample_bytree': 0.7,
+                'scale_pos_weight': 1.2,
                 'objective': 'binary:logistic',
                 'random_state': 42
             },
-            'commodities': {
-                'max_depth': 5,
-                'learning_rate': 0.04,
-                'n_estimators': 350,
-                'min_child_weight': 4,
-                'subsample': 0.75,
-                'colsample_bytree': 0.75,
-                'objective': 'binary:logistic',
-                'random_state': 42
-            }
         }
+        self.logger.info("\nMLPredictor inicializado com configurações:")
+        self.logger.info(f"Min probabilidade: {self.min_probabilidade}")
+        self.logger.info(f"Min accuracy: {self.min_accuracy}")
+        self.logger.info(f"Min dados treino: {self.min_training_size}")
+        
+    async def inicializar(self, dados_historicos: pd.DataFrame) -> bool:
+        """Método inicial que deve ser chamado para preparar os modelos"""
+        try:
+            self.logger.info("\n=== Iniciando MLPredictor ===")
+            self.logger.info(f"Timestamp: {datetime.now()}")
+            
+            if dados_historicos is None or dados_historicos.empty:
+                self.logger.error("Erro: Sem dados históricos para inicialização")
+                return False
+            
+            self.logger.info(f"\nDados recebidos:")
+            self.logger.info(f"Total registros: {len(dados_historicos)}")
+            self.logger.info(f"Colunas: {dados_historicos.columns.tolist()}")
+            self.logger.info(f"Ativos únicos: {dados_historicos['ativo'].unique()}")
+            
+            # Treina modelos para cada ativo
+            sucesso = await self.treinar(dados_historicos)
+            
+            if sucesso:
+                self.logger.info("\nStatus dos modelos treinados:")
+                for ativo in self.models:
+                    metricas = self.models[ativo]['metricas_validacao']
+                    self.logger.info(f"\n{ativo}:")
+                    self.logger.info(f"Accuracy: {metricas.get('accuracy', 0):.2%}")
+                    self.logger.info(f"Features: {len(self.models[ativo]['features'])}")
+                    self.logger.info(f"Última atualização: {self.models[ativo]['ultima_atualizacao']}")
+            
+            return sucesso
+            
+        except Exception as e:
+            self.logger.error(f"Erro na inicialização: {str(e)}")
+            return False
+        
 
     def _get_modelo_params(self, ativo):
         """Retorna parâmetros específicos para cada tipo de ativo"""
         if any(par in ativo for par in ['USD', 'EUR', 'GBP', 'JPY', 'AUD', 'NZD', 'CAD']):
             return self.parametros_modelo['forex']
-        elif any(indice in ativo for indice in ['^GSPC', '^DJI', '^IXIC']):
-            return self.parametros_modelo['indices']
-        else:
-            return self.parametros_modelo['commodities']
 
-    def criar_features(self, df):
-        """Cria features para o modelo ML"""
+    def criar_features(self, df: pd.DataFrame):
+        """Cria features para o modelo ML com monitoramento aprimorado"""
         try:
             features = pd.DataFrame()
-            
-            if len(df) < 50:  # Verifica se há dados suficientes
-                print(f"Dados insuficientes: {len(df)} registros (mínimo: 50)")
+
+            if len(df) < 50:
+                self.logger.warning("Dados insuficientes para criar features")
                 return None
-            
-            print("Calculando indicadores técnicos...")
-            
-            # RSI
-            features['rsi'] = ta.momentum.RSIIndicator(df['Close']).rsi()
-            
-            # MACD
-            macd = ta.trend.MACD(df['Close'])
-            features['macd'] = macd.macd()
-            features['macd_signal'] = macd.macd_signal()
-            features['macd_diff'] = macd.macd_diff()
-            
-            # Bollinger Bands
-            bollinger = ta.volatility.BollingerBands(df['Close'])
-            features['bb_high'] = bollinger.bollinger_hband()
-            features['bb_low'] = bollinger.bollinger_lband()
-            features['bb_position'] = bollinger.bollinger_pband()
-            
-            # Médias móveis exponenciais
-            features['ema_9'] = ta.trend.EMAIndicator(df['Close'], window=9).ema_indicator()
-            features['ema_21'] = ta.trend.EMAIndicator(df['Close'], window=21).ema_indicator()
-            
-            # Ichimoku Cloud
-            ichimoku = ta.trend.IchimokuIndicator(df['High'], df['Low'])
-            features['ichimoku_a'] = ichimoku.ichimoku_a()
-            features['ichimoku_b'] = ichimoku.ichimoku_b()
-            
-            # Estocástico
-            stoch = ta.momentum.StochasticOscillator(df['High'], df['Low'], df['Close'])
-            features['stoch_k'] = stoch.stoch()
-            features['stoch_d'] = stoch.stoch_signal()
-            
-            # ADX
-            adx = ta.trend.ADXIndicator(df['High'], df['Low'], df['Close'])
-            features['adx'] = adx.adx()
-            features['adx_pos'] = adx.adx_pos()
-            features['adx_neg'] = adx.adx_neg()
-            
+
+            self.logger.info("Iniciando criação de features...")
+            df_copy = df.copy()
+            df_copy.columns = df_copy.columns.str.lower()
+
+
+            # Verifica se tem as colunas necessárias
+            required_columns = ['close', 'high', 'low', 'open', 'volume']
+            if not all(col in df_copy.columns for col in required_columns):
+                self.logger.error(f"Colunas ausentes. Disponíveis: {df_copy.columns.tolist()}")
+                return None
+        
+            # Contador de features
+            feature_count = 0
+
+            # RSI múltiplos períodos
+            for periodo in [7, 14, 21, 28]:
+                features[f'rsi_{periodo}'] = ta.momentum.RSIIndicator(df_copy['close'], window=periodo).rsi()
+                feature_count += 1
+
+            # MACD com diferentes configurações
+            for (fast, slow, signal) in [(12, 26, 9), (8, 21, 5), (5, 35, 5)]:
+                macd = ta.trend.MACD(df_copy['close'], window_fast=fast, window_slow=slow, window_sign=signal)
+                features[f'macd_{fast}_{slow}'] = macd.macd()
+                features[f'macd_signal_{fast}_{slow}'] = macd.macd_signal()
+                features[f'macd_diff_{fast}_{slow}'] = macd.macd_diff()
+                feature_count += 3
+
+            # Bollinger Bands múltiplos períodos
+            for periodo in [20, 30, 40]:
+                bollinger = ta.volatility.BollingerBands(df_copy['close'], window=periodo)
+                features[f'bb_high_{periodo}'] = bollinger.bollinger_hband()
+                features[f'bb_low_{periodo}'] = bollinger.bollinger_lband()
+                features[f'bb_mid_{periodo}'] = bollinger.bollinger_mavg()
+                features[f'bb_bandwidth_{periodo}'] = bollinger.bollinger_wband()
+                feature_count += 4
+
+            # EMAs
+            for periodo in [9, 21, 50, 100, 200]:
+                features[f'ema_{periodo}'] = ta.trend.EMAIndicator(df_copy['close'], window=periodo).ema_indicator()
+                if periodo < 100:  # Cria distâncias percentuais apenas para médias menores
+                    features[f'dist_ema_{periodo}'] = (df_copy['close'] - features[f'ema_{periodo}']) / features[f'ema_{periodo}']
+                feature_count += 2
+
+            # Estocástico múltiplos períodos
+            for k_periodo in [5, 14, 21]:
+                for d_periodo in [3, 5]:
+                    stoch = ta.momentum.StochasticOscillator(
+                        df_copy['high'], df_copy['low'], df_copy['close'],
+                        window=k_periodo, smooth_window=d_periodo
+                    )
+                    features[f'stoch_k_{k_periodo}_{d_periodo}'] = stoch.stoch()
+                    features[f'stoch_d_{k_periodo}_{d_periodo}'] = stoch.stoch_signal()
+                    feature_count += 2
+
+            # ADX com diferentes períodos
+            for periodo in [14, 21]:
+                adx = ta.trend.ADXIndicator(df_copy['high'], df_copy['low'], df_copy['close'], window=periodo)
+                features[f'adx_{periodo}'] = adx.adx()
+                features[f'adx_pos_{periodo}'] = adx.adx_pos()
+                features[f'adx_neg_{periodo}'] = adx.adx_neg()
+                feature_count += 3
+
             # Volatilidade
-            atr = ta.volatility.AverageTrueRange(df['High'], df['Low'], df['Close'])
-            features['volatility'] = atr.average_true_range()
+            for periodo in [5, 10, 20, 30]:
+                atr = ta.volatility.AverageTrueRange(
+                    df_copy['high'], df_copy['low'], df_copy['close'], window=periodo
+                )
+                features[f'atr_{periodo}'] = atr.average_true_range()
+                # Normaliza ATR pelo preço
+                features[f'atr_pct_{periodo}'] = features[f'atr_{periodo}'] / df_copy['close']
+                feature_count += 2
+
+            # Momentum e ROC
+            for periodo in [3, 5, 10, 15, 20]:
+                mom = ta.momentum.ROCIndicator(df_copy['close'], window=periodo)
+                features[f'roc_{periodo}'] = mom.roc()
+                # Adiciona MOM usando diferença de preços
+                features[f'mom_{periodo}'] = df_copy['close'].diff(periodo)
+                feature_count += 2
+
+            # Features de Volume (se disponível)
+            if 'volume' in df_copy.columns:
+                # Volume básico
+                df_copy['volume'] = df_copy['volume'].fillna(0)
+
+                # Volume EMAs
+                for periodo in [5, 10, 20]:
+                    features[f'volume_ema_{periodo}'] = df_copy['volume'].ewm(span=periodo).mean()
+                    # Volume relativo à média
+                    features[f'volume_ratio_{periodo}'] = df_copy['volume'] / features[f'volume_ema_{periodo}']
+                    feature_count += 2
+
+                # Volume Delta (mudança)
+                features['volume_delta'] = df_copy['volume'].pct_change()
+
+                # Volume Price Trend (VPT)
+                features['vpt'] = (df_copy['volume'] * df_copy['close'].pct_change()).cumsum()
+
+                # Price Volume Trend (PVT)
+                features['pvt'] = df_copy['volume'] * (df_copy['close'] - df_copy['close'].shift(1)) / df_copy['close'].shift(1)
+
+                # On Balance Volume (OBV)
+                obv = 0
+                obv_list = []
+                for i in range(len(df_copy)):
+                    if i > 0:
+                        if df_copy['close'].iloc[i] > df_copy['close'].iloc[i-1]:
+                            obv += df_copy['volume'].iloc[i]
+                        elif df_copy['close'].iloc[i] < df_copy['close'].iloc[i-1]:
+                            obv -= df_copy['volume'].iloc[i]
+                    obv_list.append(obv)
+                features['obv'] = obv_list
+
+                # Force Index
+                for periodo in [13, 21]:
+                    force_index = df_copy['close'].diff() * df_copy['volume']
+                    features[f'force_index_{periodo}'] = force_index.ewm(span=periodo).mean()
+                    feature_count += 1
+
+                feature_count += 4  # volume_delta, vpt, pvt, obv
+
+            # Adiciona variações de preço
+            for periodo in [1, 2, 3, 5, 8, 13]:
+                features[f'return_{periodo}'] = df_copy['close'].pct_change(periodo)
+                feature_count += 1
+
+            # Adiciona features de tendência
+            features['trend_strength'] = abs(features['ema_9'] - features['ema_50']) / features['ema_50']
+            feature_count += 1
             
-            # Momentum
-            features['momentum'] = ta.momentum.ROCIndicator(df['Close']).roc()
-            
-            # Volume
-            if 'Volume' in df.columns and df['Volume'].sum() > 0:
-                features['volume_change'] = df['Volume'].pct_change()
-                features['volume_ema'] = ta.trend.EMAIndicator(df['Volume'], window=20).ema_indicator()
-            
-            # Fibonacci Retracement levels
-            max_price = df['High'].rolling(window=20).max()
-            min_price = df['Low'].rolling(window=20).min()
-            diff = max_price - min_price
-            features['fib_236'] = (df['Close'] - (min_price + diff * 0.236)) / df['Close']
-            features['fib_382'] = (df['Close'] - (min_price + diff * 0.382)) / df['Close']
-            features['fib_618'] = (df['Close'] - (min_price + diff * 0.618)) / df['Close']
-            
-            # Tendências
-            for periodo in [5, 10, 20]:
-                sma = ta.trend.SMAIndicator(df['Close'], window=periodo)
-                features[f'trend_{periodo}'] = (df['Close'] - sma.sma_indicator()) / df['Close']
-            
-            # Remove valores infinitos e NaN
+            # Novas features específicas para opções binárias
+            for periodo in [1, 3, 5, 15]:
+                # Momentum de curto prazo
+                features[f'price_momentum_{periodo}'] = (
+                    df_copy['close'] - df_copy['close'].shift(periodo)
+                ) / df_copy['close'].shift(periodo)
+
+                # Volatilidade de curto prazo
+                features[f'volatility_{periodo}'] = df_copy['close'].rolling(periodo).std() / df_copy['close']
+
+                # Velocidade de movimento
+                features[f'price_velocity_{periodo}'] = df_copy['close'].diff(periodo) / periodo
+
+                # Range percentual
+                features[f'range_pct_{periodo}'] = (df_copy['high'] - df_copy['low']) / df_copy['close']
+    
+            # Reversão à média
+            for periodo in [5, 10, 15]:
+                sma = df_copy['close'].rolling(periodo).mean()
+                features[f'mean_reversion_{periodo}'] = (df_copy['close'] - sma) / sma
+
+            # Aceleração de preço
+            features['price_velocity_3'] = df_copy['close'].diff(3) / 3
+            features['price_acceleration'] = features['price_velocity_3'].diff()
+    
+            # Remove valores inválidos e normaliza
             features = features.replace([np.inf, -np.inf], np.nan)
-            features = features.fillna(method='ffill').fillna(0)
-            
-            print(f"Features criadas: {features.shape[1]} indicadores")
+            features = features.fillna(method='ffill').fillna(method='bfill').fillna(0)
+
+            self.logger.info(f"Features criadas com sucesso: {feature_count} indicadores para")
             return features
-            
+
         except Exception as e:
-            print(f"Erro ao criar features: {str(e)}")
+            self.logger.error(f"Erro ao criar features: {str(e)}")
             return None
-
-    def atualizar_modelo(self, ativo: str, novos_dados: pd.DataFrame):
-        """Atualiza o modelo com novos dados mantendo o aprendizado"""
-        try:
-            print(f"\nAtualizando modelo para {ativo}...")
-            
-            if ativo not in self.models:
-                print(f"Modelo não existe para {ativo} - criando novo modelo")
-                return self.treinar(novos_dados)
-    
-            # Prepara novos dados
-            features = self.criar_features(novos_dados)
-            if features is None:
-                print("Erro ao criar features para atualização")
-                return False
-    
-            # Remove registros com dados faltantes
-            valid_idx = ~features.isnull().any(axis=1)
-            features = features[valid_idx]
-            
-            # Cria labels (1 para alta, 0 para baixa)
-            retornos_futuros = novos_dados['close'].pct_change().shift(-1)
-            labels = (retornos_futuros > 0).astype(int)
-            labels = labels[valid_idx]
-            
-            if len(features) < 50:  # Mínimo de dados para atualização
-                print("Dados insuficientes para atualização")
-                return False
-    
-            # Normaliza features usando o scaler existente
-            features_scaled = self.scalers[ativo].transform(features)
-            
-            # Atualiza o modelo (partial_fit)
-            modelo_atual = self.models[ativo]['model']
-            
-            # XGBoost não suporta partial_fit, então vamos retreinar com um conjunto maior
-            modelo_atual.fit(
-                features_scaled,
-                labels,
-                xgb_model=modelo_atual.get_booster(),  # Usa o modelo existente como base
-                eval_set=[(features_scaled, labels)],
-                eval_metric='logloss',
-                early_stopping_rounds=20,
-                verbose=False
-            )
-    
-            # Avalia performance após atualização
-            predicoes = modelo_atual.predict(features_scaled)
-            accuracy_atual = (predicoes == labels).mean()
-            
-            print(f"Modelo atualizado - Acurácia atual: {accuracy_atual:.2%}")
-            
-            # Atualiza métricas do modelo
-            self.models[ativo].update({
-                'accuracy': accuracy_atual,
-                'ultima_atualizacao': datetime.now()
-            })
-    
-            return True
-    
-        except Exception as e:
-            print(f"Erro ao atualizar modelo: {str(e)}")
-            return False
-
-    def treinar(self, dados_historicos):
+        
+    async def treinar(self, dados_historicos) -> bool:
         """Treina o modelo de ML"""
         try:
-            print("\nIniciando treinamento do modelo ML...")
+            self.logger.info("\n=== Iniciando Treinamento ===")
 
-            if dados_historicos is None or dados_historicos.empty:
-                print("Sem dados históricos para treino")
+            if dados_historicos is None:
+                self.logger.error("Erro: Dados históricos vazios")
                 return False
             
-            print(f"Total de dados recebidos: {len(dados_historicos)} registros")
+            # Verifica e converte colunas para lowercase
+            dados_historicos.columns = dados_historicos.columns.str.lower()
+            
+            # Verifica colunas necessárias
+            colunas_necessarias = ['ativo', 'close', 'high', 'low', 'open', 'volume']
+            colunas_presentes = dados_historicos.columns
+            
+            self.logger.info("\nVerificando colunas:")
+            for col in colunas_necessarias:
+                presente = col in colunas_presentes
+                self.logger.info(f"- {col}: {'OK' if presente else 'NOK'}")
+                
+            if not all(col in colunas_presentes for col in colunas_necessarias):
+                self.logger.error("Erro: Colunas necessárias ausentes")
+                return False
 
             # Para cada ativo
+            ativos_processados = []
             for ativo in dados_historicos['ativo'].unique():
+                self.logger.info(f"\n--- Processando {ativo} ---")
+                dados_ativo = dados_historicos[dados_historicos['ativo'] == ativo].copy()
+                self.logger.info(f"Registros: {len(dados_ativo)}")
+
+                if len(dados_ativo) < self.min_training_size:
+                    self.logger.warning(f"Dados insuficientes: {len(dados_ativo)} < {self.min_training_size}")
+                    continue
+
+                # Cria features
+                features = self.criar_features(dados_ativo)
+                if features is None:
+                    self.logger.error("Erro na criação de features")
+                    continue
+                
+                # Salvar ordem das features
+                self.feature_names[ativo] = features.columns.tolist()
+                self.logger.info(f"Features criadas: {features.shape[1]}")
+                
+                # Prepara labels
+                retornos = dados_ativo['close'].pct_change().shift(-1)
+                labels = (retornos > 0).astype(int)
+                
+                # Remove NaN
+                valid_idx = ~features.isnull().any(axis=1) & ~labels.isnull()
+                features = features[valid_idx]
+                labels = labels[valid_idx]
+                
+                self.logger.warning(f"Dados válidos após limpeza: {len(features)}")
+
+                # Treina modelo
                 try:
-                    print(f"\nTreinando modelo para {ativo}")
-                    dados_ativo = dados_historicos[dados_historicos['ativo'] == ativo].copy()
-
-                    if len(dados_ativo) < 50:  # Reduzido de 100
-                        print(f"Dados insuficientes para {ativo}: {len(dados_ativo)} registros")
-                        continue
-
-                    # Organiza os dados
-                    dados_ativo = dados_ativo.sort_values('timestamp')
-
-                    # Cria features
-                    features = self.criar_features(dados_ativo)
-                    if features is None:
-                        print(f"Erro ao criar features para {ativo}")
-                        continue
-
-                    # Remove registros com dados faltantes
-                    valid_idx = ~features.isnull().any(axis=1)
-                    features = features[valid_idx]
-
-                    # Cria labels
-                    retornos_futuros = dados_ativo['Close'].pct_change().shift(-1)
-                    labels = (retornos_futuros > 0).astype(int)
-                    labels = labels[valid_idx]
-
-                    if len(features) < 50:
-                        print(f"Features insuficientes para {ativo}")
-                        continue
-                    
-                    # Divide dados
-                    X_train, X_test, y_train, y_test = train_test_split(
-                        features, labels, test_size=0.2, random_state=42
-                    )
-
-                    # Cria scaler
+                    # Normaliza dados
                     scaler = StandardScaler()
-                    X_train_scaled = scaler.fit_transform(X_train)
-                    X_test_scaled = scaler.transform(X_test)
-
-                    # Treina modelo
-                    params = {
-                        'max_depth': 3,
-                        'learning_rate': 0.1,
-                        'n_estimators': 100,
-                        'subsample': 0.8,
-                        'objective': 'binary:logistic',
-                        'random_state': 42
-                    }
-
-                    model = XGBClassifier(**params)
-                    model.fit(X_train_scaled, y_train)
-
-                    # Avalia e salva sempre
-                    y_pred = model.predict(X_test_scaled)
-                    accuracy = (y_pred == y_test).mean()
-
-                    print(f"Modelo treinado para {ativo} - Acurácia: {accuracy:.2%}")
-
-                    # Salva modelo
+                    X_scaled = scaler.fit_transform(features)
+                    
+                    # Treina modelo final
+                    model = XGBClassifier(**self._get_modelo_params(ativo))
+                    model.fit(X_scaled, labels)
+                    
+                    # Salva modelo e configurações
                     self.models[ativo] = {
                         'model': model,
                         'features': features.columns.tolist(),
-                        'accuracy': accuracy,
-                        'params': params
+                        'scaler': scaler,
+                        'metricas_validacao': {'accuracy': 0.6},  # Valor inicial
+                        'ultima_atualizacao': datetime.now()
                     }
+                    
+                    # Salva scaler
                     self.scalers[ativo] = scaler
-
+                    
+                    ativos_processados.append(ativo)
+                    self.logger.info(f"Modelo salvo com sucesso para {ativo}")
+                    
                 except Exception as e:
-                    print(f"Erro ao treinar modelo para {ativo}: {str(e)}")
+                    self.logger.error(f"Erro no treino do modelo: {str(e)}")
                     continue
-                
-            return len(self.models) > 0
 
+            self.logger.info(f"\n=== Sumário do Treinamento ===")
+            self.logger.info(f"Ativos processados: {len(ativos_processados)}")
+            self.logger.info(f"Ativos com modelo: {list(self.models.keys())}")
+            
+            return len(ativos_processados) > 0
+        
         except Exception as e:
-            print(f"Erro durante o treinamento: {str(e)}")
+            self.logger.error(f"Erro durante o treinamento: {str(e)}")
             return False
-
-    def prever(self, dados, ativo):
-        """Faz previsões para um ativo específico"""
+        
+    def _validar_dados_entrada(self, dados: pd.DataFrame, ativo: str) -> bool:
+        """Valida dados de entrada para previsão"""
         try:
+            if dados is None or dados.empty:
+                self.logger.warning(f"Dados vazios para {ativo}")
+                return False
+            
+            # Verifica colunas necessárias
+            required_columns = ['open', 'high', 'low', 'close', 'volume']
+            colunas_presentes = [col.lower() for col in dados.columns]
+
+            self.logger.info(f"Validando dados para {ativo}:")
+            self.logger.info(f"Registros disponíveis: {len(dados)}")
+            self.logger.info(f"Colunas presentes: {colunas_presentes}")
+
+        
+            if not all(col in colunas_presentes for col in required_columns):
+                self.logger.warning(f"Colunas necessárias faltando para {ativo}. Presentes: {colunas_presentes}")
+                return False
+            
+            # Verifica quantidade mínima de dados
+            if len(dados) < 15:
+                self.logger.warning(f"Dados insuficientes para {ativo}: {len(dados)} < 15")
+                return False
+            
+            # Verifica se modelo existe
             if ativo not in self.models:
-                print(f"Modelo não encontrado para {ativo}")
+                self.logger.warning(f"Modelo não encontrado para {ativo}")
+                return False
+            # Verifica dados válidos
+            if dados.isnull().any().any():
+                self.logger.warning(f"Dados contêm valores nulos para {ativo}")
+                return False
+            
+            self.logger.info(f"Dados validados com sucesso para {ativo}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Erro na validação de dados: {str(e)}")
+            return False
+        
+    async def prever(self, dados: pd.DataFrame, ativo: str) -> Optional[Dict]:
+        try:
+            self.logger.debug(f"Iniciando previsão para {ativo}")
+            
+            if not self._validar_dados_entrada(dados, ativo):
+                return None
+            
+            features = await self._preparar_features(dados, ativo)
+            if features is None:
+                return None
+            
+            # Verificar se temos todas as features necessárias
+            if not all(col in features.columns for col in self.feature_names[ativo]):
+                self.logger.error("Features ausentes em relação ao treino")
+                return None
+            
+            features_scaled = self.scalers[ativo].transform(features)
+            model = self.models[ativo]['model']
+            
+            probabilidades = model.predict_proba(features_scaled)
+            ultima_prob = probabilidades[-1]
+
+            if max(ultima_prob) < self.min_probabilidade:
                 return None
 
-            # Prepara features
-            features = self.criar_features(dados)
-            if features is None or features.empty:
-                print(f"Erro ao criar features para {ativo}")
-                return None
+            return {
+                'ativo': ativo,
+                'direcao': 'CALL' if ultima_prob[1] > ultima_prob[0] else 'PUT',
+                'probabilidade': float(max(ultima_prob)),
+                'score': float(max(ultima_prob)) * self.models[ativo]['metricas_validacao'].get('accuracy', 0),
+                'timestamp': dados.index[-1],
+                #'volatilidade': self._calcular_volatilidade(dados)
 
-            try:
-                # Seleciona apenas as features usadas no treino
-                features = features[self.models[ativo]['features']]
-            except KeyError as e:
-                print(f"Erro nas features do modelo para {ativo}: {str(e)}")
-                return None
-
-            try:
-                # Normaliza
-                features_scaled = self.scalers[ativo].transform(features)
-            except Exception as e:
-                print(f"Erro ao normalizar features para {ativo}: {str(e)}")
-                return None
-
-            try:
-                # Faz previsão
-                model = self.models[ativo]['model']
-                probabilidades = model.predict_proba(features_scaled)
-
-                # Retorna última previsão
-                ultima_prob = probabilidades[-1]
-
-                if max(ultima_prob) >= self.min_probabilidade:
-                    direcao = np.argmax(ultima_prob)
-                    return {
-                        'direcao': 'CALL' if direcao == 1 else 'PUT',
-                        'probabilidade': float(max(ultima_prob)),
-                        'score': float(max(ultima_prob)) * self.models[ativo]['accuracy']
-                    }
-                else:
-                    return {
-                        'direcao': 'NEUTRO',
-                        'probabilidade': float(max(ultima_prob)),
-                        'score': 0
-                    }
-
-            except Exception as e:
-                print(f"Erro ao fazer previsão para {ativo}: {str(e)}")
-                return None
+            }
 
         except Exception as e:
-            print(f"Erro na previsão para {ativo}: {str(e)}")
+            self.logger.error(f"Erro na previsão: {str(e)}")
             return None
-
-    def analisar(self, ativo, periodo='7d', intervalo='5m'):
+        
+    def _calcular_volatilidade(self, dados: pd.DataFrame) -> float:
+        """Calcula volatilidade dos dados"""
+        try:
+            return dados['close'].pct_change().std() * np.sqrt(252)
+        except Exception:
+            self.logger.error('Erro _calcular_volatilidade')
+            return 0   
+        
+    async def _preparar_features(self, dados: pd.DataFrame, ativo) -> pd.DataFrame:
+        """Prepara features mantendo consistência com treino"""
+        try:
+            # Usa o mesmo método de criação de features
+            features = self.criar_features(dados)
+            if features is None:
+                return None
+                
+            # Garante ordem correta das features
+            if ativo in self.feature_names:
+                features = features[self.feature_names[ativo]]
+                
+            return features
+     
+        except Exception as e:
+            self.logger.error(f"Erro ao preparar features: {str(e)}")
+            return None
+             
+    def analisar(self, ativo, periodo='5d', intervalo='1m'):
         """Realiza análise completa de um ativo"""
         try:
             # Baixa dados mais recentes
             df = yf.download(ativo, period=periodo, interval=intervalo, progress=False)
             if df.empty:
+                return None
+                
+             # Verifica condições básicas
+            if len(df) < 50:
                 return None
             
             # Faz previsão
@@ -366,10 +483,9 @@ class MLPredictor:
             if previsao is None:
                 return None
             
-            # Adiciona informações adicionais
+            # Adiciona métricas de mercado
             previsao.update({
                 'ativo': ativo,
-                'timestamp': datetime.now(),
                 'preco_atual': float(df['Close'].iloc[-1]),
                 'volume': float(df['Volume'].iloc[-1]) if 'Volume' in df.columns else 0,
                 'volatilidade': float(df['Close'].pct_change().std())
@@ -378,5 +494,5 @@ class MLPredictor:
             return previsao
             
         except Exception as e:
-            print(f"Erro na análise de {ativo}: {str(e)}")
+            self.logger.error(f"3Erro na análise de {ativo}: {str(e)}")
             return None

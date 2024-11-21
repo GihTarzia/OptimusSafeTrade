@@ -1,118 +1,261 @@
 import asyncio
 from telegram import Bot
-from typing import Dict, List
+from typing import Dict, Optional
 from datetime import datetime
 from colorama import Fore, Style
+import json
+import logging
+from collections import deque
+
+class NotificationManager:
+    """Gerenciador de filas e histórico de notificações"""
+    def __init__(self, max_history: int = 1000):
+        self.pending = asyncio.Queue()
+        self.history = deque(maxlen=max_history)
+        self.failed = deque(maxlen=max_history)
+        self.statistics = {
+            'sent_count': 0,
+            'failed_count': 0,
+            'last_sent': None,
+            'last_error': None
+        }
+
+    async def add_notification(self, message: Dict):
+        """Adiciona notificação à fila"""
+        await self.pending.put({
+            'content': message,
+            'timestamp': datetime.now(),
+            'attempts': 0
+        })
+
+    async def get_next_notification(self) -> Optional[Dict]:
+        """Recupera próxima notificação da fila"""
+        try:
+            return await self.pending.get()
+        except asyncio.QueueEmpty:
+            return None
+
+    def record_success(self, notification: Dict):
+        """Registra notificação bem-sucedida"""
+        self.history.append({
+            **notification,
+            'status': 'sent',
+            'sent_at': datetime.now()
+        })
+        self.statistics['sent_count'] += 1
+        self.statistics['last_sent'] = datetime.now()
+
+    def record_failure(self, notification: Dict, error: str):
+        """Registra falha na notificação"""
+        self.failed.append({
+            **notification,
+            'status': 'failed',
+            'error': error,
+            'failed_at': datetime.now()
+        })
+        self.statistics['failed_count'] += 1
+        self.statistics['last_error'] = datetime.now()
 
 class Notificador:
     def __init__(self, token: str = None, chat_id: str = None):
         self.token = token
         self.chat_id = chat_id
-        #self.bot = Bot(token) if token else None
-
+        self.manager = NotificationManager()
+        self.logger = logging.getLogger('Notificador')
+        #self.logger = logger
+        
+        # Configurações
+        self.max_retries = 3
+        self.retry_delay = 5  # segundos
+        self.rate_limit = 30  # mensagens por minuto
+        self.rate_limit_period = 60  # segundos
+        
+        # Cache de mensagens recentes para evitar duplicatas
+        self.recent_messages = deque(maxlen=100)
+        
+        # Inicializa bot
         try:
             self.bot = Bot(token) if token else None
             if self.bot:
-                print(f"{Fore.GREEN}Bot Telegram inicializado com sucesso{Style.RESET_ALL}")
+                self.logger.info("Bot Telegram inicializado com sucesso")
             else:
-                print(f"{Fore.RED}Falha ao inicializar Bot Telegram{Style.RESET_ALL}")
+                self.logger.warning("Bot Telegram não configurado")
         except Exception as e:
-            print(f"{Fore.RED}Erro ao criar Bot: {str(e)}{Style.RESET_ALL}")
+            self.logger.error(f"Erro ao criar Bot: {str(e)}")
             self.bot = None
+            
+        # Inicia worker de processamento
+        asyncio.create_task(self._process_queue())
+
+    async def _process_queue(self):
+        """Processa fila de notificações"""
+        while True:
+            try:
+                # Verifica rate limit
+                recent_sent = sum(1 for msg in self.manager.history 
+                                if (datetime.now() - msg['sent_at']).total_seconds() < self.rate_limit_period)
+                
+                if recent_sent >= self.rate_limit:
+                    await asyncio.sleep(1)
+                    continue
+                
+                # Processa próxima notificação
+                notification = await self.manager.get_next_notification()
+                if notification:
+                    success = await self._send_with_retry(notification)
+                    if success:
+                        self.manager.record_success(notification)
+                    else:
+                        self.manager.record_failure(notification, "Max retries exceeded")
+                
+                await asyncio.sleep(0.1)  # Previne CPU alta
+                
+            except Exception as e:
+                self.logger.error(f"Erro no processamento da fila: {str(e)}")
+                await asyncio.sleep(1)
+
+    async def _send_with_retry(self, notification: Dict) -> bool:
+        """Tenta enviar mensagem com retries"""
+        for attempt in range(self.max_retries):
+            try:
+                if not self.bot or not self.chat_id:
+                    return False
+                
+                message = notification['content']
+                if isinstance(message, dict):
+                    message = json.dumps(message, indent=2)
+                
+                await self.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=message,
+                    parse_mode='Markdown'
+                )
+                return True
+                
+            except Exception as e:
+                self.logger.warning(f"Tentativa {attempt + 1} falhou: {str(e)}")
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(self.retry_delay)
+                continue
         
-        self.mensagens_enviadas = []
-       
+        return False
+
+    def _is_duplicate(self, mensagem: str) -> bool:
+        """Verifica se mensagem é duplicata recente"""
+        for recent in self.recent_messages:
+            if mensagem == recent['content']:
+                time_diff = (datetime.now() - recent['timestamp']).total_seconds()
+                if time_diff < 60:  # Ignora duplicatas em 1 minuto
+                    return True
+        return False
+
     async def enviar_mensagem(self, mensagem: str) -> bool:
         """Envia mensagem para o Telegram"""
-        try:       
-            if not self.bot or not self.chat_id:
-                print(f"{Fore.YELLOW}Telegram não configurado corretamente{Style.RESET_ALL}")
+        try:
+            # Verifica duplicata
+            if self._is_duplicate(mensagem):
+                self.logger.warning(f"Mensagem duplicada ignorada")
                 return False
-
-            print(f"Mensagem a ser enviada: {mensagem[:50]}...")
             
-            await self.bot.send_message(
-                chat_id=self.chat_id,
-                text=mensagem,
-                parse_mode='Markdown'
-            )
+            # Adiciona à fila
+            await self.manager.add_notification(mensagem)
             
-            print(f"{Fore.GREEN}Mensagem enviada com sucesso!{Style.RESET_ALL}")
-            
-            self.mensagens_enviadas.append({
-                'timestamp': datetime.now(),
-                'mensagem': mensagem
+            # Registra mensagem recente
+            self.recent_messages.append({
+                'content': mensagem,
+                'timestamp': datetime.now()
             })
             
             return True
+            
         except Exception as e:
-            print(f"{Fore.RED}Erro ao enviar mensagem Telegram: {str(e)}{Style.RESET_ALL}")
+            self.logger.error(f"Erro ao enfileirar mensagem: {str(e)}")
             return False
-        
-    def formatar_sinal(self, sinal: Dict) -> str:
-        """Formata sinal para mensagem do Telegram"""
-        try:
-            #s = sinal['sinal']
-            #timing = sinal['timing']
-            
-            # Emojis para direção
-            emoji_direcao = "🟢" if sinal['direcao'] == 'CALL' else "🔴"
-            
-            mensagem = [
-                f"{emoji_direcao} *SINAL {sinal['direcao']}*",
-                f"",
-                f"🎯 *Ativo:* {sinal['ativo']}",
-                f"⏰ *Entrada:* {sinal['momento_entrada'].strftime('%H:%M:%S')}",
-                f"⌛️ *Expiração:* {sinal['tempo_expiracao']} minutos",
-                f"",
-                f"📊 *Qualidade do Sinal:*",
-                f"• Score: {sinal['score']:.2%}",
-                f"• Assertividade: {sinal['assertividade']:.1f}%"
-                #f"• Tendência: {sinal['tendencia']}",
-                #f"• Volatilidade: {sinal['volatilidade']:.2%}",
-               #f"",
-               #f"💰 *Gestão:*",
-               #f"• Valor: ${sinal['risco']['valor_risco']:.2f}",
-               #f"• Stop Loss: ${sinal['risco']['stop_loss']:.2f}",
-               #f"• Take Profit: ${sinal['risco']['take_profit']:.2f}",
-               #f"",
-               #f"⚠️ *Padrões Detectados:*"
-            ]
-            
-            # Adiciona padrões detectados
-            #for padrao in sinal['sinais'][:3]:  # Limita a 3 padrões
-            #    mensagem.append(f"• {padrao['nome']}")
-            
-            return "\n".join(mensagem)  # Corrigi aqui
-            
-        except Exception as e:
-            print(f"Erro ao formatar sinal: {str(e)}")
-            return ""
 
+    def formatar_sinal(self, sinal: Dict) -> str:
+        """Formata sinal para mensagem do Telegram com visual aprimorado"""
+        try:
+            # Emojis e indicadores
+            indicadores = sinal.get('indicadores', {})
+            emoji_direcao = "🟢" if sinal['direcao'] == 'CALL' else "🔴"
+            emoji_tendencia = {
+                'CALL': '📈',
+                'PUT': '📉',
+                'NEUTRO': '↔️'
+            }.get(indicadores.get('tendencia', 'NEUTRO'), '↔️')       
+
+            # Calcula força do sinal
+            score = float(sinal.get('score', 0))
+            forca_sinal = "⭐" * max(1, min(5, int(score * 5))) 
+
+            # Formata score e assertividade em cores
+            score_formatted = f"{'🟢' if score >= 0.7 else '🟡' if score >= 0.5 else '🔴'} {score*100:.1f}%"
+            assertividade = float(sinal.get('assertividade', 50.0))
+            assert_formatted = f"{'🟢' if assertividade >= 70 else '🟡' if assertividade >= 50 else '🔴'} {assertividade:.1f}%"
+
+            # Formata indicadores
+            prob_ml = indicadores.get('ml_prob', 0) * 100
+            forca_padroes = indicadores.get('padroes_forca', 0) * 100    
+
+            mensagem = [
+                f"{'='*35}",
+                f"{emoji_direcao} *SINAL DE {sinal['direcao']}* {emoji_tendencia}",
+                f"{'='*35}",
+                f"",
+                f"🎯 *Ativo:* `{sinal['ativo'].replace('=X','')}`",
+                f"⏰ *Horário Entrada:* {sinal['momento_entrada']}",
+                f"⌛️ *Expiração:* {sinal['tempo_expiracao']} min",
+                f"💲  *Valor:* {sinal['preco_entrada']}",
+                f"",
+                f"📊 *ANÁLISE DO SINAL:* {forca_sinal}",
+                f"➤ Score: {score_formatted}",
+                f"➤ Assertividade: {assert_formatted}",
+                f"",
+                f"📈 *INDICADORES TÉCNICOS:*",
+                f"➤ Prob. ML: {prob_ml:.1f}%",
+                f"➤ Força Padrões: {forca_padroes:.1f}%",
+                f"➤ Tendência: {indicadores.get('tendencia', 'NEUTRO')}",
+                f"",
+                f"⚠️ *GESTÃO DE RISCO:*",
+                f"➤ Volatilidade: {float(sinal.get('volatilidade', 0))*100:.2f}%",
+                f"➤ Id Sinal: {sinal['id']}",
+            ]   
+
+            return "\n".join(mensagem)  
+
+        except Exception as e:
+            self.logger.error(f"Erro ao formatar sinal: {str(e)}")
+            return "Erro ao formatar mensagem"
+    
     def formatar_resultado(self, operacao: Dict) -> str:
         """Formata resultado de operação para Telegram"""
         try:
-            emoji = "✅" if operacao['resultado'] == 'WIN' else "❌"
-            emoji_direcao = "🟢" if operacao['direcao'] == 'CALL' else "🔴"
-
+            # Emojis e formatação
+            resultado_emoji = "✅" if operacao['resultado'] == 'WIN' else "❌"
+            direcao_emoji = "🟢" if operacao['direcao'] == 'CALL' else "🔴"
+            lucro_emoji = "💰" if operacao['lucro'] > 0 else "💸"
+            
+            # Formata valores monetários
+            preco_entrada = operacao.get('preco_entrada', 0)
+            preco_saida = operacao.get('preco_saida', 0)
+            
             mensagem = [
-                f"{emoji} *RESULTADO {operacao['ativo']}*",
+                f"{resultado_emoji} *RESULTADO OPERAÇÃO*",
                 f"",
-                f"📈 *Operação:* {operacao['direcao']}",
-                f"💵 *Resultado:* {'Gain' if operacao['resultado'] == 'WIN' else 'Loss'}",
-                f"💰 *Lucro:* ${operacao['lucro']:.2f}",
-                f"{emoji_direcao} *SINAL {operacao['direcao']}*",
+                f"{direcao_emoji} *Ativo:* {operacao['ativo'].replace('=X','')}",
+                f"📈 *Direção:* {operacao['direcao']}",
+                f"{lucro_emoji} *Resultado:* {operacao['resultado']}",
+                f"💵 *Lucro:* ${abs(operacao['lucro']):.2f}",
                 f"",
-                f"⏰ *Entrada:* {operacao['entrada'].strftime('%H:%M:%S')}",
-                f"⌛️ *Expiração:* {operacao['saida']}",
-                f"",
-                f"📊 *Qualidade do Sinal:*",
-                f"• Score: {operacao['score']:.2%}",
-                f"• Assertividade: {operacao['assertividade']:.1f}%"
+                f"📊 *Métricas:*",
+                f"📊 *Preços:*",
+                f"• Entrada: ${preco_entrada}",
+                f"• Saída: ${preco_saida}",
+                f"• Id sinal: ${id}",
             ]
             
-            return "\n".join(mensagem)  # Corrigi aqui
+            return "\n".join(mensagem)
             
         except Exception as e:
-            print(f"Erro ao formatar resultado: {str(e)}")
+            self.logger.error(f"Erro ao formatar resultado: {str(e)}")
             return ""

@@ -1,24 +1,22 @@
-import os
 import sys
-import schedule
-import time
-from datetime import datetime, timedelta
-from colorama import init, Fore, Style
-from pathlib import Path
-from tqdm import tqdm
-import yfinance as yf
-from utils.notificador import Notificador
+import traceback
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Union
 import ta
 import asyncio
+import yfinance as yf
+from pathlib import Path
+from datetime import datetime, time
 
 # Adiciona o diretório raiz ao PATH
 project_root = Path(__file__).parent
 sys.path.append(str(project_root))
-
-from models.auto_otimizador import AutoOtimizador
+from tqdm import tqdm
+from datetime import datetime, timedelta
+from dataclasses import dataclass
+from colorama import init, Fore, Style
+from utils.notificador import Notificador
+from typing import Dict, List, Optional
 from models.ml_predictor import MLPredictor
 from models.analise_padroes import AnalisePadroesComplexos
 from models.gestao_risco import GestaoRiscoAdaptativo
@@ -27,54 +25,374 @@ from utils.logger import TradingLogger
 from utils.database import DatabaseManager
 from config.parametros import Config
 
+class Metricas:
+    def __init__(self):
+        self.metricas = {
+            'win_rate': 0.0,
+            'profit_factor': 0.0,
+            'drawdown': 0.0,
+            'volume_operacoes': 0,
+            'assertividade_media': 0.0,
+            'tempo_medio_operacao': 0
+        }
+        self.historico_operacoes = []
+        
+    def atualizar(self, operacao: Dict):
+        self.historico_operacoes.append(operacao)
+        self._recalcular_metricas()
+        
+    def _recalcular_metricas(self):
+        # Implementa cálculo das métricas
+        pass
+    
 class TradingSystem:
     def __init__(self):
-        print(f"{Fore.CYAN}Iniciando Trading Bot...{Style.RESET_ALL}")
         self.logger = TradingLogger()
-        self.db = DatabaseManager()
-        self.config = Config()
+        self.logger.info(f"Iniciando Trading Bot...")
+        self.db = DatabaseManager(self.logger)
+        self.config = Config(self.logger)
+        self.min_tempo_entre_analises= 5
+        # Novos parâmetros de controle
+        self.ultima_analise = {}  # Registro do momento da última análise por ativo
 
-        # Inicializa o notificador
-        token = self.config.get('notificacoes.telegram.token')
-        chat_id = self.config.get('notificacoes.telegram.chat_id')
-        self.notificador = Notificador(token, chat_id)
-        
-        # Inicializa componentes principais com barra de progresso
-        componentes = [
-            ("Logger", self.logger),
-            ("Banco de Dados", self.db),
-            ("Configurações", self.config),
-            ("ML Predictor", MLPredictor()),
-            ("Análise de Padrões", AnalisePadroesComplexos()),
-            ("Gestão de Risco", GestaoRiscoAdaptativo(self.config.get('trading.saldo_inicial', 1000))),
-        ]
-
-        print(f"\n{Fore.YELLOW}Inicializando componentes...{Style.RESET_ALL}")
-        for nome, componente in tqdm(componentes, desc="Progresso"):
-            if nome == "ML Predictor":
-                self.ml_predictor = componente
-            elif nome == "Análise de Padrões":
-                self.analise_padroes = componente
-            elif nome == "Gestão de Risco":
-                self.gestao_risco = componente
-
-        # Inicializa otimizadores
-        print(f"\n{Fore.YELLOW}Configurando otimizadores...{Style.RESET_ALL}")
-        self.auto_otimizador = AutoOtimizador(self.config, self.db, self.logger)
-        self.auto_ajuste = AutoAjuste(self.config, self.db, self.logger)
-        
         # Estatísticas e histórico
-        self.historico_sinais = {}
-        self.assertividade_por_ativo = {}
         self.melhores_horarios = {}
+        
+        # Inicializa atributos que serão preenchidos posteriormente
+        self.notificador = None
+        self.ml_predictor = None
+        self.analise_padroes = None
+        self.gestao_risco = None
+        self.auto_ajuste = None
 
-    async def _notificar_sinal(self, sinal: Dict):
-        """Envia notificação de sinal"""
+    async def inicializar(self):
+        """Inicializa componentes de forma assíncrona"""
         try:
-            mensagem = self.notificador.formatar_sinal(sinal)
-            await self.notificador.enviar_mensagem(mensagem)
+            self.logger.debug("Iniciando inicialização dos componentes...")
+            # Configura notificador
+            token = self.config.get('notificacoes.telegram.token')
+            chat_id = self.config.get('notificacoes.telegram.chat_id')
+            self.notificador = Notificador(token, chat_id)
+            self.logger.info("Notificador configurado com sucesso")
+
+            # Inicializa componentes principais
+            self.ml_predictor = MLPredictor(
+                self.config,
+                self.logger
+            )
+            self.analise_padroes = AnalisePadroesComplexos(self.config, self.logger)
+            self.gestao_risco = GestaoRiscoAdaptativo(self.config.get('trading.saldo_inicial', 1000), self.logger)
+
+            # Inicializa otimizadores
+            self.logger.debug(f"\nConfigurando otimizadores...")
+            self.auto_ajuste = AutoAjuste(self.config, self.db, self.logger, Metricas)
+            self.logger.info("Componentes principais inicializados")
+
         except Exception as e:
-            self.logger.error(f"Erro ao notificar sinal: {str(e)}")
+            self.logger.critical(f"Erro na inicialização: {str(e)}")
+            raise
+
+
+    async def executar_backtest(self, dias: int = 30) -> Dict:
+        """Executa backtesting com processamento otimizado"""
+        self.logger.debug("Iniciando processo de backtesting...")
+        timeout = 1800  # 30 minutos de timeout máximo
+
+        try:
+            # Carrega dados históricos
+            dados = await self.db.get_dados_historicos(dias=dias)
+            if dados.empty:
+                self.logger.error("Sem dados suficientes para backtest")
+                return {}
+            
+            # Adicionar verificação de dados mínimos
+            if len(dados) < 20:  # Mínimo de 20 candles
+                self.logger.error(f"Dados insuficientes para backtest: {len(dados)} candles")
+                return {}
+            
+            # Agrupa dados por ativo
+            dados_por_ativo = dados.groupby('ativo')
+            resultados_por_ativo = {}
+            # Cria tasks para processar cada ativo em paralelo
+            tasks = []
+            
+            # Cria tasks para processar cada ativo em paralelo
+            tasks = [
+                asyncio.create_task(self._executar_backtest_ativo(ativo, dados_ativo))
+                for ativo, dados_ativo in dados_por_ativo
+            ]
+
+            # Aguarda todas as tasks concluírem e obtém os resultados
+            resultados_por_ativo = await asyncio.wait_for(
+                asyncio.gather(*tasks),
+                timeout=timeout
+            )
+            # Consolida resultados
+            resultados_consolidados = self._consolidar_resultados_backtest(resultados_por_ativo)
+
+            # Exibe e salva resultados
+            if len(resultados_por_ativo) > 0:
+                await self._salvar_resultados_backtest(resultados_consolidados)
+                self._exibir_resultados_backtest(resultados_consolidados)
+                return resultados_consolidados
+            else:
+                raise Exception("Nenhum resultado válido obtido no backtest")
+
+            return resultados_consolidados
+
+        except Exception as e:
+            self.logger.error(f"Erro crítico durante backtesting: {str(e)}")
+            return {}
+
+    async def monitorar_desempenho(self):
+        """Monitora desempenho e ajusta parâmetros"""
+        while True:
+            try:
+                metricas = self.gestao_risco.get_estatisticas()
+                
+                # Verifica drawdown
+                if metricas['metricas']['drawdown_atual'] > self.config.get('trading.max_drawdown'):
+                    await self.pausar_operacoes()
+                    await self.auto_ajuste.otimizar_parametros()
+                
+                # Verifica win rate
+                #if metricas['metricas']['win_rate'] < self.config.get('trading.win_rate_minimo'):
+                #    await self.auto_ajuste.ajustar_filtros('aumentar')
+                
+                await asyncio.sleep(300)
+                
+            except Exception as e:
+                self.logger.error(f"Erro no monitoramento: {str(e)}")
+                await asyncio.sleep(60)
+
+    async def pausar_operacoes(self):
+        """Pausa operações temporariamente"""
+        self.operacoes_ativas = False
+        await self.notificador.enviar_mensagem(
+            "⚠️ Operações pausadas por atingir drawdown máximo"
+        )
+        
+    def _consolidar_resultados_backtest(self, resultados_por_ativo: List[Dict]) -> Dict:
+        resultados_consolidados = {
+            'metricas_gerais': {
+                'total_trades': 0,
+                'wins': 0,
+                'losses': 0,
+                'win_rate': 0.0,
+                'profit_factor': 0.0,
+                'drawdown_maximo': 0.0,
+                'retorno_total': 0.0
+            },
+            'resultados_por_ativo': {}
+        }
+
+        for resultado in resultados_por_ativo:
+            if resultado is None or 'ativo' not in resultado:
+                continue
+            
+            ativo = resultado['ativo']
+            resultados_consolidados['resultados_por_ativo'][ativo] = resultado
+
+            resultados_consolidados['metricas_gerais']['total_trades'] += resultado['total_trades']
+            resultados_consolidados['metricas_gerais']['wins'] += resultado['wins']
+            resultados_consolidados['metricas_gerais']['losses'] += resultado['losses']
+            resultados_consolidados['metricas_gerais']['drawdown_maximo'] = max(
+                resultados_consolidados['metricas_gerais']['drawdown_maximo'],
+                resultado['drawdown_maximo']
+            )
+            resultados_consolidados['metricas_gerais']['retorno_total'] += resultado['retorno_total']
+
+        if resultados_consolidados['metricas_gerais']['total_trades'] > 0:
+            resultados_consolidados['metricas_gerais']['win_rate'] = (
+                resultados_consolidados['metricas_gerais']['wins'] / 
+                resultados_consolidados['metricas_gerais']['total_trades']
+            )
+            resultados_consolidados['metricas_gerais']['profit_factor'] = (
+                resultados_consolidados['metricas_gerais']['retorno_total'] / 
+                abs(resultados_consolidados['metricas_gerais']['drawdown_maximo']) 
+                if resultados_consolidados['metricas_gerais']['drawdown_maximo'] != 0 else float('inf')
+            )
+
+        return resultados_consolidados
+
+    async def _executar_backtest_ativo(self, ativo: str, dados: pd.DataFrame) -> Dict:
+        """Executa backtest para um ativo específico"""
+        resultados = {
+            'trades': [],
+            'total_trades': 0,
+            'wins': 0,
+            'losses': 0
+        }
+
+        try:
+            self.logger.debug(f"Iniciando backtest para {ativo}")
+            
+            for i in range(len(dados) - 1):
+                dados_ate_momento = dados.iloc[:i+1]
+                dados_futuros = dados.iloc[i+1:i+13]
+
+                # Executa análises
+                analise = await self._analisar_periodo(
+                    ativo,
+                    dados_ate_momento,
+                    dados_futuros
+                )
+
+                if analise and analise.get('trade'):
+                    trade = analise['trade']
+                    resultados['trades'].append(trade)
+                    resultados['total_trades'] += 1
+                    
+                    if trade.resultado == 'WIN':
+                        resultados['wins'] += 1
+                    else:
+                        resultados['losses'] += 1
+
+        except Exception as e:
+            self.logger.error(f"Erro no backtest de {ativo}: {str(e)}")
+            return resultados
+
+        return resultados
+
+    async def _analisar_periodo(self, ativo: str, dados_historicos: pd.DataFrame, 
+                              dados_futuros: pd.DataFrame) -> Optional[Dict]:
+        """Análise unificada de período para backtest"""
+        try:
+            # Análise ML
+            sinal_ml = await self.ml_predictor.prever(dados_historicos, ativo)
+            if not sinal_ml:
+                return None
+
+            # Análise padrões
+            analise_tecnica = self.analise_padroes.analisar(
+                dados=dados_historicos,
+                ativo=ativo
+            )
+            if not analise_tecnica:
+                return None
+
+            # Validação do sinal
+            if not self._validar_sinal(sinal_ml, analise_tecnica):
+                return None
+
+            # Simulação do trade
+            trade = self._simular_trade(
+                timestamp=dados_historicos.index[-1],
+                dados_futuros=dados_futuros,
+                sinal_ml=sinal_ml,
+                analise_tecnica=analise_tecnica
+            )
+
+            return {'trade': trade} if trade else None
+
+        except Exception as e:
+            self.logger.error(f"Erro na análise do período: {str(e)}")
+            return None
+
+
+    def _exibir_resultados_backtest(self, resultados: Dict):
+        """Exibe resultados do backtest"""
+        self.logger.info(f"\n=== Resultados do Backtest ===")
+        self.logger.info(f"Total de trades: {resultados['metricas_gerais']['total_trades']}")
+        self.logger.info(f"Win Rate: {resultados['metricas_gerais']['win_rate']:.2%}")
+        self.logger.info(f"Profit Factor: {resultados['metricas_gerais']['profit_factor']:.2f}")
+        self.logger.info(f"Drawdown Máximo: {resultados['metricas_gerais']['drawdown_maximo']:.2f}%")
+        self.logger.info(f"Retorno Total: {resultados['metricas_gerais']['retorno_total']:.2f}%")
+        
+        self.logger.info(f"\nMelhores Horários:")
+        for hora, stats in resultados['melhores_horarios'].items():
+            self.logger.info(f"• {hora}:00 - Win Rate: {stats['win_rate']:.2f}% ({stats['total_trades']} trades)")
+    
+    async def _salvar_resultados_backtest(self, resultados: Dict):
+        """Salva resultados do backtest no banco de dados"""
+        try:
+            await self.db.salvar_resultados_backtest({
+                'timestamp': datetime.now(),
+                'metricas': resultados['metricas_gerais'],
+                'melhores_horarios': resultados['melhores_horarios'],
+                'evolucao_capital': resultados['evolucao_capital']
+            })
+        except Exception as e:
+            self.logger.error(f"Erro ao salvar resultados do backtest: {str(e)}")
+    
+    def _validar_sinal(self, sinal_ml: Dict, analise_tecnica: Dict) -> bool:
+        """Valida se sinal atende critérios mínimos"""
+        try:
+            
+            if sinal_ml['direcao'] != analise_tecnica['direcao']:
+                self.logger.warning(f"Sinal rejeitado: direção ML ({sinal_ml['direcao']}) != direção técnica ({analise_tecnica['direcao']})")
+                return False
+        
+            # Score mínimo
+            if sinal_ml['probabilidade'] < self.config.get('analise.min_score_entrada'):
+                return False
+            
+            # Direções concordantes
+            if sinal_ml['direcao'] != analise_tecnica['direcao']:
+                return False
+
+            # Volatilidade em range aceitável
+            volatilidade = float(sinal_ml.get('volatilidade', 0))
+            if volatilidade > 0.008 or volatilidade < 0.001:
+                return False
+
+            # Força mínima dos padrões
+            if analise_tecnica.get('forca_sinal', 0) < 0.7:  # Mínimo de 70%
+                return False
+
+            # Confirmações técnicas
+            if len(analise_tecnica.get('padroes', [])) < 3:  # Mínimo de 3 confirmações
+                return False
+                
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Erro na validação: {str(e)}")
+            return False
+
+    def _simular_trade(self, timestamp: datetime, dados_futuros: pd.DataFrame, 
+                      sinal_ml: Dict, analise_tecnica: Dict) -> Optional[Dict]:
+        """Simula uma operação completa"""
+        try:
+            if dados_futuros.empty:
+                return None
+                
+            preco_entrada = dados_futuros.iloc[0]['Open']
+            tempo_exp = analise_tecnica.get('tempo_expiracao', 5)
+            
+            # Encontra candle de expiração
+            idx_exp = min(int(tempo_exp * 12), len(dados_futuros) - 1)  # 12 candles = 1 hora
+            if idx_exp < 1:
+                return None
+                
+            preco_saida = dados_futuros.iloc[idx_exp]['Close']
+            
+            # Determina resultado
+            if sinal_ml['direcao'] == 'CALL':
+                resultado = 'WIN' if preco_saida > preco_entrada else 'LOSS'
+            else:  # PUT
+                resultado = 'WIN' if preco_saida < preco_entrada else 'LOSS'
+                
+            # Calcula lucro
+            variacao = abs(preco_saida - preco_entrada) / preco_entrada
+            lucro = variacao * 100 if resultado == 'WIN' else -variacao * 100
+            
+            return BacktestTrade(
+                entrada_timestamp=timestamp,
+                saida_timestamp=dados_futuros.index[idx_exp],
+                ativo=sinal_ml['ativo'],
+                direcao=sinal_ml['direcao'],
+                preco_entrada=preco_entrada,
+                preco_saida=preco_saida,
+                resultado=resultado,
+                lucro=lucro,
+                score_entrada=sinal_ml['probabilidade'],
+                assertividade_prevista=sinal_ml.get('score', 0)
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Erro na simulação: {str(e)}")
+            return None
 
     async def _notificar_resultado(self, operacao: Dict):
         """Envia notificação de resultado"""
@@ -84,14 +402,14 @@ class TradingSystem:
     def calcular_timing_entrada(self, ativo: str, sinal: Dict) -> Dict:
         """Calcula o melhor momento para entrada baseado nos padrões históricos"""
         try:
-            print(f"\nCalculando timing para {ativo}...")
+            self.logger.debug(f"\nCalculando timing para {ativo}...")
             agora = datetime.now()
             
             # Analisa padrões de tempo mais favoráveis
             horarios_sucesso = self.db.get_horarios_sucesso(ativo)
             
             if not horarios_sucesso:
-                print(f"Sem histórico de horários. Usando tempo padrão.")
+                self.logger.warning(f"Sem histórico de horários. Usando tempo padrão.")
                 return {
                     'momento_ideal': agora + timedelta(minutes=1),
                     'tempo_espera': timedelta(minutes=1),
@@ -114,15 +432,15 @@ class TradingSystem:
             
             # Calcula tempo de espera
             if melhor_horario:
-                print(f"Melhor horário encontrado: {melhor_horario.strftime('%H:%M')}")
-                print(f"Taxa de sucesso no horário: {maior_taxa_sucesso:.1%}")
+                self.logger.info(f"Melhor horário encontrado: {melhor_horario.strftime('%H:%M')}")
+                self.logger.info(f"Taxa de sucesso no horário: {maior_taxa_sucesso:.1%}")
                 
                 if hora_atual < melhor_horario:
                     tempo_espera = datetime.combine(agora.date(), melhor_horario) - datetime.combine(agora.date(), hora_atual)
                 else:
                     tempo_espera = timedelta(minutes=1)
             else:
-                print(f"Nenhum horário ótimo encontrado. Usando tempo padrão.")
+                self.logger.warning(f"Nenhum horário ótimo encontrado. Usando tempo padrão.")
                 tempo_espera = timedelta(minutes=1)
             
             momento_entrada = agora + tempo_espera
@@ -140,329 +458,276 @@ class TradingSystem:
                 'tempo_espera': timedelta(minutes=1),
                 'taxa_sucesso_horario': 0.5
             }
-        
+            
     def calcular_assertividade(self, ativo: str, sinal: Dict) -> float:
         """Calcula a probabilidade de sucesso do sinal"""
         try:
-            print(f"\nCalculando assertividade para {ativo}...")
+            self.logger.debug(f"\nCalculando assertividade para {ativo}...")
             
             # Componentes da assertividade
             prob_ml = sinal.get('ml_prob', 0)
-            forca_padroes = sinal.get('padroes_força', 0)
-            historico = self.db.get_assertividade_recente(ativo, sinal['direcao']) or 50
-            volatilidade_ok = 0.001 <= sinal.get('volatilidade', 0) <= 0.005
+            forca_padroes = float(sinal.get('score', 0))  # Usando 'score' como backup
             
-            # Pesos
-            peso_ml = 0.45
-            peso_padroes = 0.35
-            peso_historico = 0.10
-            peso_volatilidade = 0.10
+            # Extrai probabilidade ML dos indicadores se disponível
+            if 'indicadores' in sinal:
+                prob_ml = float(sinal['indicadores'].get('ml_prob', prob_ml))
+                forca_padroes = float(sinal['indicadores'].get('padroes_forca', forca_padroes))
+
+            # Garante valores entre 0 e 1
+            prob_ml = min(1.0, max(0.0, prob_ml))
+            forca_padroes = min(1.0, max(0.0, forca_padroes))
             
-            # Cálculo ponderado
-            assertividade = (
-                prob_ml * peso_ml +
-                forca_padroes * peso_padroes +
-                (historico/100) * peso_historico +
-                (1 if volatilidade_ok else 0.5) * peso_volatilidade
-            ) * 100
+            # Histórico específico para o tempo de expiração
+            tempo_exp = sinal.get('tempo_expiracao', 5)
+            historico = float(self.db.get_assertividade_recente(
+                ativo, 
+                sinal['direcao'],
+                tempo_expiracao=tempo_exp
+            ) or 50) / 100
             
-            print(f"Componentes da assertividade:")
-            print(f"ML: {prob_ml:.1%}")
-            print(f"Padrões: {forca_padroes:.1%}")
-            print(f"Histórico: {historico:.1f}%")
-            print(f"Volatilidade OK: {'Sim' if volatilidade_ok else 'Não'}")
-            print(f"Assertividade final: {assertividade:.1f}%")
+            # Verifica momento do dia
+            hora_atual = datetime.now().hour
+            horarios_sucesso = self.db.get_horarios_sucesso(ativo)
+            taxa_horario = horarios_sucesso.get(f"{hora_atual:02d}:00", 0.5)
+            
+            # Analisa volatilidade
+            volatilidade = float(sinal.get('volatilidade', 0))
+            volatilidade_score = 1.0
+            if volatilidade > 0:
+                if 0.001 <= volatilidade <= 0.005:  # Faixa ideal
+                    volatilidade_score = 1.0
+                elif 0.0005 <= volatilidade < 0.001:  # Baixa demais
+                    volatilidade_score = 0.7
+                elif 0.005 < volatilidade <= 0.01:  # Alta mas aceitável
+                    volatilidade_score = 0.8
+                else:  # Muito alta ou muito baixa
+                    volatilidade_score = 0.5
+            
+            # Verifica tendência
+            tendencia_match = sinal.get('tendencia') == sinal.get('direcao', '')
+            tendencia_score = 1.2 if tendencia_match else 0.8
+            
+            # Cálculo ponderado com pesos ajustados
+            base_score = (
+                prob_ml * 0.40 +            # Probabilidade ML (40%)
+                forca_padroes * 0.25 +      # Força dos padrões (25%)
+                historico * 0.20 +          # Histórico recente (20%)
+                volatilidade_score * 0.15 + # Score de volatilidade (15%)
+                taxa_horario * 0.20         # Performance no horário
+            )
+            
+            # Aplica multiplicador de tendência
+            assertividade = base_score * tendencia_score
+
+            # Limita entre 0 e 100
+            assertividade = min(100, max(0, assertividade * 100))
+            
+            self.logger.info(f"Componentes da assertividade:")
+            self.logger.info(f"ML: {prob_ml:.1%}")
+            self.logger.info(f"Padrões: {forca_padroes:.1%}")
+            self.logger.info(f"Histórico: {historico:.1%}")
+            self.logger.info(f"Volatilidade Score: {volatilidade_score:.1%}")
+            self.logger.info(f"Tendência Match: {tendencia_match}")
+            self.logger.info(f"Score Final: {assertividade:.1f}%")
+            self.logger.info(f"Taxa horário ({hora_atual}h): {taxa_horario:.1%}")
             
             return round(assertividade, 2)
             
         except Exception as e:
             self.logger.error(f"Erro ao calcular assertividade: {str(e)}")
             return 0
-        
-    def baixar_dados_historicos(self):
-        """Baixa dados históricos iniciais para todos os ativos"""
-        print(f"{Fore.YELLOW}Iniciando download de dados históricos...{Style.RESET_ALL}")
-
-        ativos = self.config.get_ativos_ativos()
-        for ativo in tqdm(ativos, desc="Baixando dados"):
-            try:
-                # Download de 30 dias de dados em intervalos de 5 minutos
-                dados = yf.download(
-                    ativo,
-                    period="30d",
-                    interval="5m",
-                    progress=False
-                )
-
-                if not dados.empty:
-                    print(f"\nBaixados {len(dados)} registros para {ativo}")
-                    #print("Colunas disponíveis:", dados.columns.tolist())
-                    # Prepara os dados para salvar
-                    dados_para_salvar = dados.reset_index()
-                    dados_para_salvar['ativo'] = ativo
-
-                    # Salva no banco de dados
-                    self.db.salvar_precos(ativo, dados_para_salvar)
-                    print(f"{Fore.GREEN}Dados baixados com sucesso para {ativo}: {len(dados)} registros{Style.RESET_ALL}")
-                else:
-                    print(f"{Fore.RED}Nenhum dado disponível para {ativo}{Style.RESET_ALL}")
-
-            except Exception as e:
-                print(f"{Fore.RED}Erro ao baixar dados para {ativo}: {str(e)}{Style.RESET_ALL}")
-
-    def _avaliar_condicoes_mercado(self, ativo: str, dados: pd.DataFrame) -> Dict:
-        """Avalia se o mercado está em boas condições para operar"""
-        try:
-            resultados = {
-                'operar': False,
-                'motivo': '',
-                'score_mercado': 0
-            }
-
-            # 1. Volatilidade
-            volatilidade = dados['close'].pct_change().std()
-            volatilidade_ok = 0.0001 <= volatilidade <= 0.005  # ajuste estes valores
-
-            # 2. Tendência definida
-            ema_curta = ta.trend.EMAIndicator(dados['close'], window=9).ema_indicator()
-            ema_longa = ta.trend.EMAIndicator(dados['close'], window=21).ema_indicator()
-            tendencia_definida = abs((ema_curta.iloc[-1] - ema_longa.iloc[-1]) / ema_longa.iloc[-1]) > 0.0001
-
-            # 3. Movimento consistente
-            ultimos_candles = dados.tail(20)
-            range_medio = (ultimos_candles['high'] - ultimos_candles['low']).mean()
-            movimento_consistente = range_medio > dados['close'].iloc[-1] * 0.0003
-
-            # 4. Não está lateralizado
-            max_20 = dados['high'].tail(20).max()
-            min_20 = dados['low'].tail(20).min()
-            nao_lateral = (max_20 - min_20) / min_20 > 0.001
-
-            # Calcula score do mercado
-            score = 0
-            if volatilidade_ok: score += 0.25
-            if tendencia_definida: score += 0.25
-            if movimento_consistente: score += 0.25
-            if nao_lateral: score += 0.25
-
-            resultados['score_mercado'] = score
-
-            # Define se deve operar
-            if score >= 0.75:  # pelo menos 3 condições atendidas
-                resultados['operar'] = True
-                resultados['motivo'] = "Mercado favorável"
-            else:
-                resultados['motivo'] = f"Mercado não ideal (score: {score:.2f})"
-                if not volatilidade_ok: resultados['motivo'] += " - Volatilidade inadequada"
-                if not tendencia_definida: resultados['motivo'] += " - Sem tendência clara"
-                if not movimento_consistente: resultados['motivo'] += " - Movimento inconsistente"
-                if not nao_lateral: resultados['motivo'] += " - Mercado lateral"
-
-
-            # Registra métricas
-            self.db.registrar_metricas_mercado(ativo, {
-                'timestamp': datetime.now(),
-                'volatilidade': volatilidade,
-                'score_mercado': score,
-                'range_medio': range_medio,
-                'tendencia_definida': 1 if tendencia_definida else 0,
-                'movimento_consistente': 1 if movimento_consistente else 0,
-                'lateralizacao': 0 if nao_lateral else 1,
-                'detalhes': {
-                    'ema_diff': float((ema_curta.iloc[-1] - ema_longa.iloc[-1]) / ema_longa.iloc[-1]),
-                    'max_20': float(max_20),
-                    'min_20': float(min_20)
-                }
-            })
-
-            return resultados
-
-        except Exception as e:
-            return {'operar': False, 'motivo': f"Erro na análise: {str(e)}", 'score_mercado': 0}
-    
 
     async def analisar_mercado(self):
-        """Análise principal do mercado"""
-        print(f"\n{Fore.CYAN}=== Nova Análise ==={Style.RESET_ALL}")
-        print(f"Hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print("="*80)
-        
-        sinais_validos = []
-        ativos_analisados = 0
-        
-        for ativo in self.config.get_ativos_ativos():
+        """Análise contínua do mercado"""
+        ativos_falha = set()  # Conjunto para controlar ativos com problemas
+
+        while True:
             try:
-                print(f"\n{Fore.CYAN}Analisando {ativo}...{Style.RESET_ALL}")
-                ativos_analisados += 1
+                # Obtém lista de ativos ativos
+                ativos = self.config.get_ativos_ativos()
                 
-                # Verifica horário de operação
-                if not self.config.is_horario_operacional():
-                    print(f"{Fore.YELLOW}Fora do horário operacional{Style.RESET_ALL}")
-                    return
-                
-                # Análise ML
-                if ativo not in self.ml_predictor.models:
-                    print(f"{Fore.YELLOW}Modelo não disponível para {ativo}{Style.RESET_ALL}")
+                # Remove ativos que falharam recentemente
+                ativos_analise = [a for a in ativos if a not in ativos_falha]
+                if not ativos_analise:
+                    self.logger.warning("Nenhum ativo disponível para análise")
+                    await asyncio.sleep(self.min_tempo_entre_analises * 2)
+                    ativos_falha.clear()  # Limpa lista de falhas após espera
                     continue
-                    
-                sinal_ml = self.ml_predictor.analisar(ativo)
-                if not sinal_ml:
-                    print(f"{Fore.YELLOW}Sem sinal ML para {ativo}{Style.RESET_ALL}")
-                    continue
-                if sinal_ml:
-                    print(f"Sinal ML obtido - Direção: {sinal_ml.get('direcao')} - Prob: {sinal_ml.get('probabilidade', 0):.2%}")
-                if not sinal_ml or sinal_ml.get('direcao') == 'NEUTRO':
-                    print(f"{Fore.YELLOW}Sem sinal ou sinal neutro para {ativo}{Style.RESET_ALL}")
-                    continue
-                
-                # Análise de padrões
-                dados_mercado = self.db.get_dados_mercado(ativo, limite=100)
-                if dados_mercado is None or dados_mercado.empty:
-                    print(f"{Fore.YELLOW}Sem dados de mercado para {ativo}{Style.RESET_ALL}")
-                    continue
-
-                analise_padroes = self.analise_padroes.analisar(ativo)
-                if not analise_padroes:
-                    print(f"{Fore.YELLOW}Sem padrões detectados para {ativo}{Style.RESET_ALL}")
-                    continue
-
-                # Avalia condições do mercado
-                condicoes = self._avaliar_condicoes_mercado(ativo, dados_mercado)
-                print(f"Condições de mercado: {condicoes['motivo']}")
-                print(f"Score do mercado: {condicoes['score_mercado']:.2f}")
-                
-                # Se mercado não está bom, ainda treina ML mas não gera sinais
-                if not condicoes['operar']:
-                    print(f"{Fore.YELLOW}Mercado não favorável para {ativo} - Apenas atualizando ML{Style.RESET_ALL}")
-                    # Aqui ainda faz o treino do ML para manter o aprendizado
-                    if ativo in self.ml_predictor.models:
-                        self.ml_predictor.atualizar_modelo(ativo, dados_mercado)
-                    continue
-
-                if not analise_padroes:
-                    print(f"{Fore.YELLOW}Sem padrões detectados para {ativo}{Style.RESET_ALL}")
-                    continue
-                
-                # Combina análises
-                sinal_combinado = self._combinar_analises(
-                    ativo, sinal_ml, analise_padroes, dados_mercado
-                )
-                
-                if not sinal_combinado:
-                    print(f"{Fore.YELLOW}Sem sinal combinado para {ativo}{Style.RESET_ALL}")
-                    continue
-                        
-                # Verifica direção final antes de notificar
-                if sinal_combinado['direcao'] == 'NEUTRO':
-                    print(f"{Fore.YELLOW}Sinal final neutro para {ativo}{Style.RESET_ALL}")
-                    continue
-        
-                if sinal_combinado['score'] >= self.config.get('analise.min_score_entrada', 0.7):
-                    print(f"Score suficiente: {sinal_combinado['score']:.2%} >= {self.config.get('analise.min_score_entrada', 0.7):.2%}")
-
-                    # Calcula timing e assertividade
-                    timing = self.calcular_timing_entrada(ativo, sinal_combinado)
-                    assertividade = self.calcular_assertividade(ativo, sinal_combinado)    
-                    
-                    print(f"Timing calculado - Momento: {timing['momento_ideal'].strftime('%H:%M:%S')}")
-                    print(f"Assertividade calculada: {assertividade:.1f}%")
-
-                    # Aplica filtros de qualidade
-                    if self._validar_sinal(ativo, sinal_combinado, timing, assertividade):
-                        print(f"Sinal validado com sucesso")
-
-                        # Calcula risco
-                        risco = self.gestao_risco.calcular_risco_operacao(
-                            ativo,
-                            sinal_combinado['score'],
-                            assertividade
-                        )
-                        
-                        if risco:
-                            sinais_validos.append({
-                                'ativo': ativo,
-                                'sinal': sinal_combinado,
-                                'timing': timing,
-                                'assertividade': assertividade,
-                                'risco': risco,
-                                'score_final': self._calcular_score_final(
-                                    sinal_combinado, timing, assertividade
-                                )
-                            })
-                            print(f"{Fore.GREEN}Sinal válido encontrado para {ativo}{Style.RESET_ALL}")
-                    else:
-                        print(f"{Fore.YELLOW}Sinal não passou na validação{Style.RESET_ALL}")
-                        continue
-                else:
-                    print(f"{Fore.YELLOW}Score insulficiente {sinal_combinado['score']} para {ativo}, precisa ser maior igual a {self.config.get('analise.min_score_entrada', 0.7)}{Style.RESET_ALL}")
-                    continue
-            except Exception as e:
-                self.logger.error(f"Erro ao analisar {ativo}: {str(e)}")
-        
-        # Exibe resumo da análise
-        print(f"\n{Fore.CYAN}=== Resumo da Análise ==={Style.RESET_ALL}")
-        print(f"Ativos analisados: {ativos_analisados}")
-        print(f"Sinais válidos encontrados: {len(sinais_validos)}")
-        
-        if sinais_validos:
-            # Ordena sinais por score final
-            sinais_validos.sort(key=lambda x: x['score_final'], reverse=True)
             
-            # Exibe resultados
-            self._exibir_resumo_analise(sinais_validos)
-            #self._notificar_resultado(sinais_validos)
+                # Cria tasks apenas uma vez para cada ativo
+                tasks = [
+                    asyncio.create_task(self._analisar_ativo(ativo))
+                    for ativo in ativos_analise
+                ]
 
-            # Registra sinais válidos
-            for sinal in sinais_validos:
-                    try:
-                        dados_registro = self._formatar_sinal_para_registro(sinal)
-                        self.registrar_sinal(**dados_registro)
-                        await self._notificar_sinal(dados_registro)
-                    except Exception as e:
-                        print(f"Erro ao processar sinal: {str(e)}")
-                        return ""
-        else:
-            print(f"\n{Fore.YELLOW}Nenhum sinal válido encontrado neste momento{Style.RESET_ALL}")
+                # Executa análises em paralelo
+                resultados = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Processa resultados válidos
+                for i, resultado in enumerate(resultados):
+                    if isinstance(resultado, Exception):
+                        self.logger.error(f"Erro ao analisar {ativos_analise[i]}: {str(resultado)}")
+                        ativos_falha.add(ativos_analise[i])
+                        self.logger.error(f"Stack trace completo: {traceback.format_exc()}")
+                    elif resultado:
+                        self.logger.info(f"Sinal gerado para {ativos_analise[i]}: {resultado}")
+                        await self._processar_sinal(resultado)
+                    else:
+                        self.logger.warning(f"Nenhum sinal gerado para {ativos_analise[i]}")
+
+
+                # Limpa ativos com falha periodicamente
+                if len(ativos_falha) > 0 and len(resultados) % 10 == 0:
+                    ativos_falha.clear()
+
+                await asyncio.sleep(self.min_tempo_entre_analises)
+
+            except Exception as e:
+                self.logger.error(f"Erro no ciclo de análise: {str(e)}")
         
-        print(f"\nPróxima análise em 30 segundos...")
+    async def _processar_sinal(self, sinal: Dict):
+        """Processa sinal identificado"""
+        try:
+            
+            # Valida horário novamente antes de processar o sinal
+            if not self._validar_horario_operacao(datetime.now()):
+                self.logger.warning("Sinal ignorado devido ao horário inadequado")
+                return
+        
+            # Calcula melhor horário
+            timing = self.calcular_timing_entrada(sinal['ativo'], sinal)
 
-    # Antes de chamar registrar_sinal, vamos ajustar o formato dos dados
-    def _formatar_sinal_para_registro(self, sinal_dados: Dict) -> Dict:
-        """Formata os dados do sinal para registro"""
-        return {
-            'ativo': sinal_dados['ativo'],
-            'direcao': sinal_dados['sinal']['direcao'],
-            'momento_entrada': sinal_dados['timing']['momento_ideal'],
-            'tempo_expiracao': sinal_dados['sinal']['tempo_expiracao'],
-            'score': sinal_dados['sinal']['score'],
-            'assertividade': sinal_dados['assertividade'],
-            'padroes': sinal_dados['sinal']['sinais'],
-            'indicadores': {
-                'ml_prob': sinal_dados['sinal']['ml_prob'],
-                'padroes_forca': sinal_dados['sinal']['padroes_força'],
-                'tendencia': sinal_dados['sinal']['tendencia']
-            },
-            'ml_prob': sinal_dados['sinal']['ml_prob'],
-            'volatilidade': sinal_dados['sinal']['volatilidade']
-        }
+            # Calcula assertividade
+            assertividade = self.calcular_assertividade(
+                sinal['ativo'], 
+                sinal
+            )
+            
+            # Adiciona assertividade ao sinal
+            sinal['assertividade'] = assertividade
+        
+            dados_mercado = await self.db.get_dados_mercado(sinal['ativo'])
+            if dados_mercado.empty:
+                self.logger.error(f"Não foi possível obter dados para {sinal['ativo']}")
+                return None
+
+            preco_entrada = dados_mercado['Close'].iloc[-1]
+            volatilidade = dados_mercado['Close'].pct_change().std() * np.sqrt(252)
+
+            # Registra sinal no banco de dados
+            sinal_id = await self.db.registrar_sinal({
+                'ativo': sinal['ativo'],
+                'direcao': sinal['direcao'],
+                'momento_entrada': timing['momento_ideal'],
+                'tempo_expiracao': sinal.get('tempo_expiracao', 5),
+                'score': sinal['score'],
+                'assertividade': assertividade,
+                'ml_prob': float(sinal['indicadores'].get('ml_prob', 0)),
+                'padroes_forca': float(sinal['indicadores'].get('padroes_forca', 0)),
+                'indicadores': sinal.get('indicadores', {}),
+                'processado': False,
+                'preco_entrada':preco_entrada,
+                'volatilidade':volatilidade,
+            })
+
+            # Formata mensagem completa
+            sinal_formatado = {
+                'id': sinal_id,
+                'ativo': sinal['ativo'],
+                'direcao': sinal['direcao'],
+                'momento_entrada': timing['momento_ideal'].strftime('%H:%M:%S'),
+                'tempo_expiracao': sinal['tempo_expiracao'],
+                'score': sinal['score'],
+                'assertividade': assertividade,
+                'indicadores': sinal['indicadores'],
+                'preco_entrada': preco_entrada,
+                'volatilidade': volatilidade,
+            }
+
+            # Notifica via telegram
+            mensagem = self.notificador.formatar_sinal(sinal_formatado)
+            await self.notificador.enviar_mensagem(mensagem)
+
+        except Exception as e:
+            self.logger.error(f"Erro ao processar sinal: {str(e)}")
+
+    async def _analisar_ativo(self, ativo: str) -> Optional[Dict]:
+        """Analisa um único ativo de forma assíncrona"""
+        try:
+            self.logger.debug(f"Iniciando análise de {ativo}")
+            
+            # Valida horário atual
+            agora = datetime.now()
+            if not self._validar_horario_operacao(agora):
+                self.logger.warning(f"Horário não apropriado para análise de {ativo}")
+                return None
+            
+            
+            # Obtém dados do mercado de forma assíncrona
+            dados_mercado = await self.db.get_dados_mercado(ativo)
+            if dados_mercado is None or dados_mercado.empty:
+                self.logger.warning(f"Sem dados para {ativo}")
+                return None 
+
+            # Análises em paralelo
+            analises = await asyncio.gather(
+                self.ml_predictor.prever(dados_mercado, ativo),
+                self.analise_padroes.analisar(dados_mercado, ativo=ativo)
+            )
+            
+            sinal_ml, analise_tecnica = analises
+            
+            if not sinal_ml or not analise_tecnica:
+                return None
+                
+            # Combina análises
+            sinal_combinado = self._combinar_analises(
+                ativo, sinal_ml, analise_tecnica, dados_mercado
+            )
+            if not sinal_combinado:
+                return None
+            
+            if sinal_combinado:
+                self.ultima_analise[ativo] = datetime.now()
+                
+            # Retorna o sinal combinado no formato esperado por _processar_sinal
+            return {
+                'ativo': ativo,
+                'direcao': sinal_combinado['direcao'],
+                'score': sinal_combinado['score'],
+                'tempo_expiracao': sinal_combinado['tempo_expiracao'],
+                'indicadores': {
+                    'ml_prob': sinal_combinado['ml_prob'],
+                    'padroes_forca': sinal_combinado['padroes_forca'],
+                    'tendencia': sinal_combinado['tendencia'],
+                    'volatilidade': sinal_combinado['volatilidade'],
+                    'score': sinal_combinado['score']
+                },
+                'volatilidade': sinal_combinado['volatilidade']
+            }
+            
+        except Exception as e:
+            self.logger.error(f"1Erro na análise de {ativo}: {str(e)}")
+            return None
 
     def _combinar_analises(self, ativo: str, sinal_ml: Dict, analise_padroes: Dict, dados_mercado: pd.DataFrame) -> Dict:
         """Combina análises ML e técnica"""
         try:
-            print(f"\nCombinando análises para {ativo}...")
-            
+            self.logger.debug(f"\nCombinando análises para {ativo}...")
+            self.logger.info(f"Sinal ML: {sinal_ml}")
+            self.logger.info(f"Análise Técnica: {analise_padroes}")            
             # Verifica dados de entrada
             if not all([sinal_ml, analise_padroes]):
-                print(f"Dados insuficientes para análise completa")
+                self.logger.warning(f"Dados insuficientes para análise completa")
                 return None
 
             if dados_mercado is None or dados_mercado.empty:
-                print(f"Sem dados de mercado disponíveis")
+                self.logger.warning(f"Sem dados de mercado disponíveis")
                 return None
 
             # Verifica se temos as colunas necessárias
-            if 'close' not in dados_mercado.columns:
-                print(f"\n{Fore.MAGENTA}Dados de mercado inválidos. Colunas disponíveis: {dados_mercado.columns.tolist()}{Style.RESET_ALL}")
+            if 'Close' not in dados_mercado.columns:
+                self.logger.warning(f"Dados de mercado inválidos. Colunas disponíveis: {dados_mercado.columns.tolist()}")
                 return None
             
             # Direção predominante
@@ -470,163 +735,134 @@ class TradingSystem:
             direcao_padroes = analise_padroes.get('direcao')
             
             if not all([direcao_ml, direcao_padroes]):
-                print(f"\n{Fore.MAGENTA}Direções não definidas{Style.RESET_ALL}")
+                self.logger.warning(f"Direções não definidas")
                 return None
             
             # Análise de tendência
             tendencia = self._analisar_tendencia(dados_mercado)
             
-            # Score base (média ponderada)
-            score_ml = min(sinal_ml.get('probabilidade', 0) * 0.7, 0.7)  # Limita em 70%
-            score_padroes = min(analise_padroes.get('forca_sinal', 0) * 0.2, 0.2)  # Limita em 20%
-            score_tendencia = min(tendencia.get('forca', 0) * 0.1, 0.1)  # Limita em 10%
-                    
-            # Score inicial
-            score_final = score_ml + score_padroes + score_tendencia
+            # Normaliza scores individuais
+            score_ml = min(sinal_ml.get('probabilidade', 0), 0.85)  # Limita em 85%
+            score_padroes = min(analise_padroes.get('forca_sinal', 0), 0.75)  # Limita em 75%
+            score_tendencia = min(tendencia.get('forca', 0), 0.6)  # Limita em 60%
+                  
+                  
+            # NOVO: Bloqueio imediato se direção e tendência divergirem
+            if tendencia['direcao'] != direcao_ml and tendencia['direcao'] != 'NEUTRO':
+                self.logger.warning(f"Sinal descartado: divergência direção ({direcao_ml}) vs tendência ({tendencia['direcao']})")
+                return None      
+              
+            # Score base ponderado
+            score_final = (
+                score_ml * 0.45 +          # 45% peso ML (reduzido)
+                score_padroes * 0.25 +     # 25% peso padrões
+                score_tendencia * 0.30     # 30% peso tendência (aumentado)
+            )
 
-            # Bônus com limitadores
+
+            # Se chegou até aqui e a tendência for neutra, penaliza o score
+            if tendencia['direcao'] == 'NEUTRO':
+                score_final *= 0.8  # Penalização de 20% para tendência neutra
+
+
+            # Bônus mais agressivos para concordância
             if direcao_ml == direcao_padroes:
-                score_final = min(score_final * 1.5, 1.0)
-
+                score_final *= 1.25  # +25% (aumentado)
             if tendencia['direcao'] == direcao_ml:
-                score_final = min(score_final * 1.3, 1.0)
+                score_final *= 0,6   # Penaliza em 40% quando há divergência
 
-            if sinal_ml.get('probabilidade', 0) > 0.6:
-                score_final = min(score_final * 1.25, 1.0)
+            # Limita score final
+            score_final = min(0.95, max(0.1, score_final))
 
-            if analise_padroes.get('num_padroes', 0) >= 2:
-                score_final = min(score_final * 1.2, 1.0)
+            # Calcula volatilidade corretamente
+            volatilidade = dados_mercado['Close'].pct_change().rolling(20).std() * np.sqrt(252)
+            volatilidade = float(volatilidade.iloc[-1]) if not volatilidade.empty else 0
 
-            # Garante que o score final está entre 0 e 1
-            score_final = max(0, min(score_final, 1.0))
+            # Determina tempo de expiração baseado na volatilidade
+            tempo_expiracao = self._calcular_tempo_expiracao(volatilidade)
 
-            # Arredonda para 2 casas decimais
-            score_final = round(score_final, 2)
-            
-            return {
+            resultado = {
                 'ativo': ativo,
                 'direcao': direcao_ml,
                 'score': score_final,
-                'ml_prob': sinal_ml.get('probabilidade', 0),
-                'padroes_força': analise_padroes.get('forca_sinal', 0),
+                'ml_prob': score_ml,
+                'padroes_forca': score_padroes,
                 'tendencia': tendencia['direcao'],
                 'sinais': analise_padroes.get('padroes', []),
-                'tempo_expiracao': analise_padroes.get('tempo_expiracao', 5),
-                'volatilidade': sinal_ml.get('volatilidade', 0)
+                'tempo_expiracao': tempo_expiracao,
+                'volatilidade': volatilidade,
+                'indicadores': {
+                    'ml_prob': score_ml,
+                    'padroes_forca': score_padroes,
+                    'tendencia': tendencia['direcao']
+                }
             }
+            self.logger.info(f"Resultado combinado: {resultado}")
+            return resultado
             
         except Exception as e:
-            self.logger.error(f"\n{Fore.RED}Erro ao combinar análises: {str(e)}{Style.RESET_ALL}")
+            self.logger.error(f"\nErro ao combinar análises: {str(e)}")
             return None
-        
-    def _exibir_resumo_analise(self, sinais_validos: List[Dict]):
-        """Exibe resumo da análise atual"""
+    
+    def _validar_horario_operacao(self, timestamp: datetime) -> bool:
         try:
-            print(f"\n{Fore.CYAN}=== Resumo da Análise ==={Style.RESET_ALL}")
-            print(f"Hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            print("="*80)
-            
-            if not sinais_validos:
-                print(f"\n{Fore.YELLOW}Nenhum sinal válido encontrado{Style.RESET_ALL}")
-                return
-            
-            print(f"\n{Fore.GREEN}Sinais encontrados: {len(sinais_validos)}{Style.RESET_ALL}")
-            print("-"*80)
-            
-            # Exibe top 5 sinais
-            for i, sinal in enumerate(sinais_validos[:5], 1):
-                self._exibir_sinal_detalhado(sinal, ranking=i)
-            
-            # Estatísticas gerais
-            self._exibir_estatisticas_gerais(sinais_validos)
-            
-        except Exception as e:
-            self.logger.error(f"{Fore.RED}Erro ao exibir resumo: {str(e)}{Style.RESET_ALL}")
+            hora = timestamp.hour
+            minuto = timestamp.minute
+            horario_atual = timestamp.time()
 
-    def _exibir_sinal_detalhado(self, sinal: Dict, ranking: int = None):
-        """Exibe detalhes de um sinal específico"""
-        try:
-            ativo = sinal['ativo']
-            s = sinal['sinal']
-            timing = sinal['timing']
-            
-            # Cabeçalho
-            if ranking:
-                print(f"\n{Fore.CYAN}#{ranking} - Análise Detalhada: {ativo}{Style.RESET_ALL}")
-            else:
-                print(f"\n{Fore.CYAN}Análise Detalhada: {ativo}{Style.RESET_ALL}")
-            print("-"*80)
-            
-            # Direção e Timing
-            cor_direcao = Fore.GREEN if s['direcao'] == 'CALL' else Fore.RED
-            print(f"Direção: {cor_direcao}{s['direcao']}{Style.RESET_ALL}")
-            print(f"Entrada: {timing['momento_ideal'].strftime('%H:%M:%S')}")
-            print(f"Expiração: {s['tempo_expiracao']} minutos")
-            
-            # Scores e Probabilidades
-            print(f"\n{Fore.YELLOW}Indicadores de Qualidade:{Style.RESET_ALL}")
-            print(f"Score Final: {sinal['score_final']:.2%}")
-            print(f"Assertividade: {sinal['assertividade']:.1f}%")
-            print(f"Probabilidade ML: {s['ml_prob']:.1%}")
-            print(f"Força dos Padrões: {s['padroes_força']:.1%}")
-            
-            # Gestão de Risco
-            print(f"\n{Fore.YELLOW}Gestão de Risco:{Style.RESET_ALL}")
-            print(f"Valor Sugerido: ${sinal['risco']['valor_risco']:.2f}")
-            print(f"Stop Loss: ${sinal['risco']['stop_loss']:.2f}")
-            print(f"Take Profit: ${sinal['risco']['take_profit']:.2f}")
-            
-            # Padrões Detectados
-            if s['sinais']:
-                print(f"\n{Fore.YELLOW}Padrões Detectados:{Style.RESET_ALL}")
-                for padrao in s['sinais']:
-                    print(f"• {padrao['nome']} ({padrao['direcao']}) - Força: {padrao['forca']:.1%}")
-            
-            # Informações Adicionais
-            print(f"\n{Fore.YELLOW}Informações Adicionais:{Style.RESET_ALL}")
-            print(f"Tendência: {s['tendencia']}")
-            print(f"Volatilidade: {s['volatilidade']:.2%}")
-            print(f"Taxa de Sucesso no Horário: {timing['taxa_sucesso_horario']:.1%}")
-            
-            print("-"*80)
-            
-        except Exception as e:
-            self.logger.error(f"{Fore.RED}Erro ao exibir sinal detalhado: {str(e)}{Style.RESET_ALL}")
+            # Verifica período do dia
+            is_madrugada = hora >= 0 and hora < 7
+            is_noite = hora >= 20
 
-    def _exibir_estatisticas_gerais(self, sinais_validos: List[Dict]):
-        """Exibe estatísticas gerais da análise atual"""
-        try:
-            print(f"\n{Fore.CYAN}=== Estatísticas Gerais ==={Style.RESET_ALL}")
-            print("-"*80)
-            
-            # Distribuição por direção
-            calls = len([s for s in sinais_validos if s['sinal']['direcao'] == 'CALL'])
-            puts = len([s for s in sinais_validos if s['sinal']['direcao'] == 'PUT'])
-            
-            print("Distribuição de Sinais:")
-            print(f"CALL: {calls} ({calls/len(sinais_validos)*100:.1f}%)")
-            print(f"PUT: {puts} ({puts/len(sinais_validos)*100:.1f}%)")
-            
-            # Médias
-            scores = [s['score_final'] for s in sinais_validos]
-            assertividades = [s['assertividade'] for s in sinais_validos]
-            
-            print(f"\nMédia de Scores: {np.mean(scores):.2%}")
-            print(f"Média de Assertividade: {np.mean(assertividades):.1f}%")
-            
-            # Performance do dia
-            stats_dia = self.gestao_risco.get_estatisticas()
-            if stats_dia['total_operacoes'] > 0:
-                print(f"\nPerformance do Dia:")
-                print(f"Operações: {stats_dia['total_operacoes']}")
-                print(f"Win Rate: {stats_dia['win_rate']:.1f}%")
-                print(f"Resultado: {stats_dia['resultado_dia']:+.2f}%")
-            
-            print("-"*80)
-            
+            # Ajusta requisitos baseado no período
+            min_taxa_sucesso = self.config.get('horarios.analise_horarios.win_rate_minimo_horario', 0.60)
+
+            if is_madrugada or is_noite:
+                min_taxa_sucesso *= 0.9  # Reduz requisito em 10% para horários alternativos
+                self.logger.info(f"Operando em horário alternativo: {horario_atual} - Min taxa: {min_taxa_sucesso:.1%}")
+
+            # Verifica taxa de sucesso
+            taxa_sucesso = self.db.get_taxa_sucesso_horario(hora)
+
+            if taxa_sucesso < min_taxa_sucesso:
+                self.logger.warning(
+                    f"Taxa de sucesso insuficiente para horário {hora}h: {taxa_sucesso:.1%} "
+                    f"(mínimo: {min_taxa_sucesso:.1%})"
+                )
+                return False
+
+            # Evita horários de alta volatilidade apenas em horário comercial
+            if not (is_madrugada or is_noite):
+                horarios_volateis = [
+                    (8, 30, 9, 30),   # Abertura NY
+                    (14, 30, 15, 30), # Fechamento Europa
+                    (15, 45, 16, 15)  # Alta volatilidade NY
+                ]
+
+                for inicio_h, inicio_m, fim_h, fim_m in horarios_volateis:
+                    inicio = time(inicio_h, inicio_m)
+                    fim = time(fim_h, fim_m)
+                    if inicio <= horario_atual <= fim:
+                        self.logger.warning(f"Horário volátil detectado: {horario_atual}")
+                        return False
+
+            # Evita últimos 5 minutos de cada hora
+            if minuto >= 55:
+                self.logger.warning("Últimos 5 minutos da hora")
+                return False
+
+            self.logger.info(
+                f"Horário validado: {horario_atual} "
+                f"(Taxa sucesso: {taxa_sucesso:.1%}, "
+                f"Min requerido: {min_taxa_sucesso:.1%})"
+            )
+            return True
+
         except Exception as e:
-            self.logger.error(f"{Fore.RED}Erro ao exibir estatísticas: {str(e)}{Style.RESET_ALL}")
-   
+            self.logger.error(f"Erro ao validar horário: {str(e)}")
+            return False
+
+    
     def _analisar_tendencia(self, dados: pd.DataFrame) -> Dict:
         """Analisa a tendência atual do ativo"""
         try:
@@ -634,198 +870,271 @@ class TradingSystem:
                 return {'direcao': 'NEUTRO', 'forca': 0}
                 
             # Certifica que estamos usando as colunas corretas
-            if 'close' not in dados.columns:
-                print(f"Colunas disponíveis: {dados.columns.tolist()}")
+            if 'Close' not in dados.columns and 'close' not in dados.columns:
+                self.logger.warning(f"Colunas disponíveis: {dados.columns.tolist()}")
                 return {'direcao': 'NEUTRO', 'forca': 0}
                 
-            # Calcula médias móveis
-            close = dados['close']
+                
+            # Padroniza nome da coluna
+            close_col = 'Close' if 'Close' in dados.columns else 'close'
+            close = dados[close_col]
+            
+            # Calcula indicadores de tendência
             ema9 = ta.trend.EMAIndicator(close, window=9).ema_indicator()
             ema21 = ta.trend.EMAIndicator(close, window=21).ema_indicator()
+            macd = ta.trend.MACD(close).macd()
+            rsi = ta.momentum.RSIIndicator(close).rsi()
             
-            # Inclinação das médias
-            inclinacao_9 = (ema9.iloc[-1] - ema9.iloc[-5]) / ema9.iloc[-5]
-            inclinacao_21 = (ema21.iloc[-1] - ema21.iloc[-5]) / ema21.iloc[-5]
+            # Analisa inclinações das médias (últimos 3 períodos para mais sensibilidade)
+            inclinacao_9 = (ema9.iloc[-1] - ema9.iloc[-3]) / ema9.iloc[-3]
+            inclinacao_21 = (ema21.iloc[-1] - ema21.iloc[-3]) / ema21.iloc[-3]
             
-            forca = abs(inclinacao_9) * 2  # Dobra a força da tendência
-            
-            if inclinacao_9 > 0 and inclinacao_21 > 0:
-                return {'direcao': 'CALL', 'forca': min(forca * 1.5, 1.0)}
-            elif inclinacao_9 < 0 and inclinacao_21 < 0:
-                return {'direcao': 'PUT', 'forca': min(forca * 1.5, 1.0)}
+            # Reduz o limiar para detecção de tendência
+            limiar_inclinacao = 0.0005  # 0.05% de variação
+
+            # Analisa MACD
+            macd_positivo = macd.iloc[-1] > 0
+            macd_crescente = macd.iloc[-1] > macd.iloc[-2]
+                           
+            # Analisa RSI
+            rsi_ultimo = rsi.iloc[-1]
+            rsi_crescente = rsi.iloc[-1] > rsi.iloc[-2]
+
+            # Sistema de pontos para determinar tendência
+            pontos = 0
+
+            # Análise da inclinação das médias
+            if inclinacao_9 > limiar_inclinacao: pontos += 2
+            if inclinacao_21 > limiar_inclinacao: pontos += 2
+            if inclinacao_9 < -limiar_inclinacao: pontos -= 2
+            if inclinacao_21 < -limiar_inclinacao: pontos -= 2
+
+            # Análise do MACD
+            if macd_positivo: pontos += 1
+            else: pontos -= 1
+            if macd_crescente: pontos += 1
+            else: pontos -= 1
+
+            # Análise do RSI
+            if rsi_ultimo > 50 and rsi_crescente: pontos += 1
+            if rsi_ultimo < 50 and not rsi_crescente: pontos -= 1
+
+            # Calcula força da tendência (normalizada entre 0 e 1)
+            forca = abs(pontos) / 8  # 8 é a pontuação máxima possível
+            forca = min(1.0, max(0.0, forca))
+
+            # Determina direção
+            if pontos >= 2:
+                return {'direcao': 'CALL', 'forca': forca}
+            elif pontos <= -2:
+                return {'direcao': 'PUT', 'forca': forca}
             else:
-                return {'direcao': 'NEUTRO', 'forca': 0}
-                    
+                return {'direcao': 'NEUTRO', 'forca': forca}
+        
         except Exception as e:
-            print(f"{Fore.RED}Erro ao analisar tendência: {str(e)}{Style.RESET_ALL}")
-            print(f"Colunas disponíveis: {dados.columns.tolist() if dados is not None else 'None'}")
+            self.logger.error(f"Erro ao analisar tendência: {str(e)}")
+            self.logger.error(f"Colunas disponíveis: {dados.columns.tolist() if dados is not None else 'None'}")
             return {'direcao': 'NEUTRO', 'forca': 0}
-
     
-    def _validar_sinal(self, ativo: str, sinal: Dict, timing: Dict, assertividade: float) -> bool:
-        """Valida se o sinal atende todos os critérios mínimos"""
-        try:
-            # Critérios mínimos
-            min_assertividade = 50.0  # Era 65
-            min_score = 0.55        # Era 0.7
-            min_taxa_horario = 0.1  # Mantido
-            
-            # Ranges de volatilidade mais permissivos
-            min_vol = 0.00005  # Era 0.001
-            max_vol = 0.01    # Era 0.005  
-                     
-            if assertividade < min_assertividade:
-                print(f"Assertividade insuficiente: {assertividade:.1f}% (mín: {min_assertividade}%)")
-                return False
-                
-            if sinal['score'] < min_score:
-                print(f"Score insuficiente: {sinal['score']:.2f} (mín: {min_score})")
-                return False
-                
-            if timing['taxa_sucesso_horario'] < min_taxa_horario:
-                print(f"Taxa de sucesso no horário insuficiente: {timing['taxa_sucesso_horario']:.1%} (mín: {min_taxa_horario:.1%})")
-                return False
-            
-            print(f"{Fore.GREEN}Todos os critérios atendidos{Style.RESET_ALL}")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Erro ao validar sinal: {str(e)}")
-            return False
-        
-    def _calcular_score_final(self, sinal: Dict, timing: Dict, assertividade: float) -> float:
-        """Calcula score final considerando todos os fatores"""
-        try:
-            # Pesos dos componentes
-            peso_sinal = 0.4
-            peso_timing = 0.3
-            peso_assertividade = 0.3
-            
-            # Normaliza valores
-            score_sinal = sinal['score']
-            score_timing = timing['taxa_sucesso_horario']
-            score_assertividade = assertividade / 100
-            
-            # Calcula score ponderado
-            score_final = (
-                score_sinal * peso_sinal +
-                score_timing * peso_timing +
-                score_assertividade * peso_assertividade
-            )
-            
-            return round(score_final, 4)
-            
-        except Exception as e:
-            self.logger.error(f"Erro ao calcular score final: {str(e)}")
-            return 0
-
-    def exibir_resultado(self, ativo, sinal, timing, assertividade, risco):
-        """Exibe o resultado da análise de forma formatada"""
-        cor = Fore.GREEN if sinal['direcao'] == 'CALL' else Fore.RED
-        print(f"\n{Fore.CYAN}Análise para {ativo}:{Style.RESET_ALL}")
-        print(f"Direção: {cor}{sinal['direcao']}{Style.RESET_ALL}")
-        print(f"Momento ideal de entrada: {timing['momento_ideal'].strftime('%H:%M:%S')}")
-        print(f"Tempo de expiração: {self.config.get('trading.tempo_expiracao_padrao')} minutos")
-        print(f"Assertividade esperada: {Fore.YELLOW}{assertividade}%{Style.RESET_ALL}")
-        print(f"Valor sugerido: {Fore.YELLOW}${risco['valor_risco']}{Style.RESET_ALL}")
-        print(f"Sinais detectados: {', '.join(sinal['sinais'])}")
-        print("-"*50)
-
-    def registrar_sinal(self, ativo: str, direcao: str, momento_entrada: datetime,
-                       tempo_expiracao: int, score: float, assertividade: float,
-                       padroes: List, indicadores: Dict, ml_prob: float,
-                       volatilidade: float):
-        """Registra o sinal no banco de dados"""
-        self.db.registrar_sinal(
-            ativo=ativo,
-            direcao=direcao,
-            momento_entrada=momento_entrada,
-            tempo_expiracao=tempo_expiracao,
-            score=score,
-            assertividade=assertividade,
-            padroes=padroes,
-            indicadores=indicadores,
-            ml_prob=ml_prob,
-            volatilidade=volatilidade
-        )
-        
     async def verificar_resultados(self):
-        """Verifica resultados de sinais anteriores"""
+        """Verifica resultados das operações de forma otimizada"""
         try:
-            sinais_pendentes = self.db.get_sinais_sem_resultado()
+            while True:
+                sinais_pendentes = await self.db.get_sinais_sem_resultado()
+                self.logger.debug(f"Verificando {len(sinais_pendentes)} sinais pendentes")
 
-            for sinal in sinais_pendentes:
-                # Calcula tempo decorrido
-                momento_entrada = datetime.strptime(sinal['timestamp'].split('.')[0], '%Y-%m-%d %H:%M:%S')
-                tempo_expiracao = sinal['tempo_expiracao']
-                momento_expiracao = momento_entrada + timedelta(minutes=tempo_expiracao)
 
-                if datetime.now() > momento_expiracao:
-                    # Busca preço de entrada e saída
-                    preco_entrada = self.db.get_preco(sinal['ativo'], momento_entrada)
-                    preco_saida = self.db.get_preco(sinal['ativo'], momento_expiracao)
+                for sinal in sinais_pendentes:
+                    try:
+                        self.logger.info(f"\nProcessando sinal ID {sinal.get('id')} - {sinal.get('ativo')}")
 
-                    if preco_entrada and preco_saida:
-                        # Determina resultado
-                        if sinal['direcao'] == 'CALL':
-                            resultado = 'WIN' if preco_saida > preco_entrada else 'LOSS'
-                        else:  # PUT
-                            resultado = 'WIN' if preco_saida < preco_entrada else 'LOSS'
-
-                        # Calcula lucro/prejuízo
-                        variacao = abs(preco_saida - preco_entrada) / preco_entrada
-                        lucro = variacao * 100 if resultado == 'WIN' else -variacao * 100
-
-                        # Registra resultado
-                        if self.db.registrar_resultado_sinal(sinal['id'], resultado, lucro):
-                            print(f"Resultado registrado com sucesso")
-                            
-                            # Notifica resultado
-                            await self._notificar_resultado({
-                                'ativo': sinal['ativo'],
-                                'direcao': sinal['direcao'],
-                                'resultado': resultado,
-                                'lucro': lucro,
-                                'entrada': momento_entrada,
-                                'saida': momento_expiracao,
-                                'score': sinal['score'],
-                                'assertividade': sinal['assertividade']
-                            })
+                        # Verifica se timestamp já é datetime ou precisa converter
+                        if isinstance(sinal['timestamp'], datetime):
+                            momento_entrada = sinal['timestamp']
                         else:
-                            print(f"Erro ao registrar resultado")
+                            momento_entrada = datetime.strptime(sinal['timestamp'], '%Y-%m-%d %H:%M:%S')
+                  
+                        tempo_expiracao = sinal['tempo_expiracao']
+                        momento_expiracao = momento_entrada + timedelta(minutes=tempo_expiracao)
+
+                        if datetime.now() > momento_expiracao:
+                            self.logger.info(f"Sinal {sinal['id']} expirado, calculando resultado...")
+
+                            # Busca preços
+                            preco_entrada = sinal['preco_entrada']
+                            preco_saida = await self.db.get_preco(sinal['ativo'], momento_expiracao)
+
+                            if preco_entrada and preco_saida:
+                                self.logger.info(f"Preços obtidos - Entrada: {preco_entrada}, Saída: {preco_saida}")
+
+                                # Calcula resultado
+                                if sinal['direcao'] == 'CALL':
+                                    resultado = 'WIN' if preco_saida > preco_entrada else 'LOSS'
+                                else:  # PUT
+                                    resultado = 'WIN' if preco_saida < preco_entrada else 'LOSS'
+
+                                # Calcula lucro fixo baseado na configuração
+                                payout = self.config.get('trading.payout', 0.85)  # 85% padrão
+                                valor_entrada = self.config.get('trading.valor_entrada', 100)
+                                
+                                lucro = valor_entrada * payout if resultado == 'WIN' else -valor_entrada
+
+                                self.logger.info(f"Resultado calculado: {resultado} (lucro: {lucro})")
+
+                                # Atualiza sinal no banco de dados
+                                await self.db.atualizar_resultado_sinal(
+                                    sinal['id'],
+                                    resultado=resultado,
+                                    lucro=lucro,
+                                    preco_saida=preco_saida,
+                                    data_processamento=datetime.now()
+                                )
+
+                                # Notifica resultado
+                                await self._notificar_resultado({
+                                    'ativo': sinal['ativo'],
+                                    'direcao': sinal['direcao'],
+                                    'resultado': resultado,
+                                    'lucro': lucro,
+                                    'preco_entrada': preco_entrada,
+                                    'preco_saida': preco_saida,
+                                    'id': sinal['id'],
+                                })
+
+                    except Exception as e:
+                        self.logger.error(f"Erro ao processar sinal {sinal['id']}: {str(e)}")
+
+                await asyncio.sleep(10)  # Espera 10 segundos entre verificações
 
         except Exception as e:
-            self.logger.error(f"Erro ao verificar resultados: {str(e)}")
+            self.logger.error(f"Erro no verificador de resultados: {str(e)}")      
+            
+    def _calcular_tempo_expiracao(self, volatilidade: float) -> int:
+        """Define tempo de expiração para opções binárias"""
+        try:
+            if volatilidade < 0.003:  # Volatilidade baixa
+                return 15  # Mais tempo para o movimento se desenvolver
+            elif volatilidade > 0.008:  # Volatilidade muito alta
+                return 1   # Tempo curto para evitar reversões
+            elif volatilidade > 0.006:  # Volatilidade alta
+                return 3   # Tempo moderado-curto
+            else:  # Volatilidade ideal
+                return 5   # Tempo padrão
+                
+        except Exception as e:
+            self.logger.error(f"Erro ao definir tempo de expiração: {str(e)}")
+            return 5
+   
+    # TradingSystem - Correção da função baixar_dados_historicos
+    async def baixar_dados_historicos(self):
+        """Baixa dados históricos iniciais para todos os ativos"""
+        self.logger.debug(f"Iniciando download de dados históricos...")
+
+        ativos = self.config.get_ativos_ativos()
+        dados_salvos = False
+        hoje = datetime.now()
+        dfs = []
+
+        for ativo in tqdm(ativos, desc="Baixando dados"):
+            try:
+                # Download de 30 dias de dados em intervalos de 1 minuto
+                # Divide em 4 períodos de 7 dias para obter dados de 1 minuto
+                for i in range(4):
+                    end = hoje - timedelta(days=i*7)
+                    start = end - timedelta(days=7)
+
+                    df = yf.download(
+                        ativo,
+                        start=start,
+                        end=end,
+                        interval="1m",
+                        progress=False
+                    )
+                    if not df.empty:
+                        dfs.append(df)
+
+                if len(dfs) > 0:  # Verifica se temos dados
+                    dados_combinados = pd.concat(dfs).sort_index()
+                    dados_combinados = dados_combinados[~dados_combinados.index.duplicated(keep='first')]
+
+                    if not dados_combinados.empty:
+                        dados_combinados.columns = [col if col == 'Volume' else col.title() for col in dados_combinados.columns]
+                        dados_combinados = dados_combinados[['Open', 'High', 'Low', 'Close', 'Volume']]
+
+                        sucesso = await self.db.salvar_precos(ativo, dados_combinados)
+                        if sucesso:
+                            dados_salvos = True
+                            self.logger.info(f"Dados salvos com sucesso para {ativo}: {len(dados_combinados)} registros")
+                    else:
+                        self.logger.error(f"Erro ao salvar dados para {ativo}")
+                else:
+                    self.logger.warning(f"Nenhum dado disponível para {ativo}")
+
+            except Exception as e:
+                self.logger.error(f"Erro ao baixar dados para {ativo}: {str(e)}")
+
+        if dados_salvos:
+            self.logger.info(f"Download de dados históricos concluído com sucesso")
+            return True
+        else:
+            self.logger.warning(f"Nenhum dado foi salvo durante o processo")
+            return False
 
     async def executar(self):
         """Loop principal do sistema"""
         try:
-            print(f"\n{Fore.CYAN}Iniciando sequência de inicialização...{Style.RESET_ALL}")
+            self.logger.info(f"\nIniciando sequência de inicialização...")
 
-            # Inicializa modelos e dados históricos
-            print(f"\n{Fore.YELLOW}Fase 1: Baixando dados históricos...{Style.RESET_ALL}")
-            self.baixar_dados_historicos()
+            # Inicializa componentes básicos
+            await self.inicializar()
 
-            # Aqui você pode adicionar uma barra de progresso para o download
-            
-            print(f"\n{Fore.YELLOW}Fase 2: Treinando modelo ML...{Style.RESET_ALL}")
-            self.ml_predictor.treinar(self.db.get_dados_treino())
-            
-            print(f"\n{Fore.GREEN}Sistema pronto! Iniciando primeira análise...{Style.RESET_ALL}")
+            # Fase 1: Baixa dados históricos
+            self.logger.info(f"\nFase 1: Baixando dados históricos...")
+            sucesso_download = await self.baixar_dados_historicos()
+            if not sucesso_download:
+                raise Exception("Falha ao baixar dados históricos")
 
-            # Loop principal assíncrono
-            while True:
-                await self.analisar_mercado()
-                await self.verificar_resultados()  # Adiciona verificação de resultados
-                await asyncio.sleep(30)  # Espera 30 segundos
-                
-        except KeyboardInterrupt:
-            self.logger.info("Sistema encerrado pelo usuário")
+            # Fase 2: Inicializa ML com dados baixados
+            self.logger.info(f"\nFase 2: Inicializando modelos ML...")
+            dados_historicos = await self.db.get_dados_historicos(dias=30)
+            if dados_historicos.empty:
+                self.logger.error(f"Sem dados históricos para treinar modelos")
+                raise Exception("Sem dados históricos para treinar modelos")
+
+            sucesso_ml = await self.ml_predictor.inicializar(dados_historicos)
+            if not sucesso_ml:
+                self.logger.error(f"Falha ao inicializar modelos ML")
+                raise Exception("Falha ao inicializar modelos ML")
+
+            # Fase 3: Executa backtesting
+            #self.logger.info(f"\nFase 3: Executando backtesting...")
+            #resultados_backtest = await self.executar_backtest(dias=30)
+
+            # Fase 4: Inicia monitoramento
+            self.logger.info(f"\nSistema pronto! Iniciando monitoramento contínuo...")
+
+            # Cria tasks para monitoramento e verificação
+            tasks = [
+                asyncio.create_task(self.analisar_mercado()),
+                asyncio.create_task(self.verificar_resultados()),
+                asyncio.create_task(self.monitorar_desempenho())  # Adiciona monitoramento
+            ]
+
+            # Executa tasks
+            await asyncio.gather(*tasks)
+
         except Exception as e:
             self.logger.error(f"Erro crítico: {str(e)}")
-
+            raise
+        except KeyboardInterrupt:
+            self.logger.info("Sistema encerrado pelo usuário")
+      
 if __name__ == "__main__":
     init()  # Inicializa colorama
+    
+    # Limpa qualquer event loop residual
+    if asyncio._get_running_loop() is not None:
+        asyncio._set_running_loop(None)
     
     sistema = TradingSystem()
     
@@ -834,3 +1143,16 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("Sistema encerrado pelo usuário")
     
+    
+@dataclass
+class BacktestTrade:
+    entrada_timestamp: datetime
+    saida_timestamp: datetime
+    ativo: str
+    direcao: str  # 'CALL' ou 'PUT'
+    preco_entrada: float
+    preco_saida: float
+    resultado: str  # 'WIN' ou 'LOSS'
+    lucro: float
+    score_entrada: float
+    assertividade_prevista: float

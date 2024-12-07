@@ -26,21 +26,21 @@ class MLPredictor:
         self.max_depth = ml_config['max_depth']
         self.learning_rate = ml_config['learning_rate']
         self.n_estimators = ml_config['n_estimators']
-        self.min_confirmacoes = self.config.get('ml_config.min_confirmacoes')  # Novo: mínimo de confirmações técnicas
-
-        self.min_training_size = 1000
+        self.min_confirmacoes = self.config.get('ml_config.min_confirmacoes')
+        self.min_training_size = 2000
         
         
         # Novos parâmetros otimizados por tipo de ativo
         self.parametros_modelo = {
             'forex': {
-                'max_depth': 5,
+                'max_depth': 6,
                 'learning_rate': 0.01,
-                'n_estimators': 300,
-                'min_child_weight': 5,
-                'subsample': 0.7,
-                'colsample_bytree': 0.7,
-                'scale_pos_weight': 1.2,
+                'n_estimators': 500,
+                'min_child_weight': 3,
+                'subsample': 0.8,
+                'colsample_bytree': 0.8,
+                'gamma': 0.1,
+                'scale_pos_weight': 1.0,
                 'objective': 'binary:logistic',
                 'random_state': 42
             },
@@ -90,180 +90,120 @@ class MLPredictor:
             return self.parametros_modelo['forex']
 
     def criar_features(self, df: pd.DataFrame):
-        """Cria features para o modelo ML com monitoramento aprimorado"""
+        """Cria features otimizadas para timeframe 1min"""
         try:
-            features = pd.DataFrame()
+            self.logger.debug("Iniciando criação de features...")
+            features = pd.DataFrame()   
 
-            if len(df) < 50:
+            if len(df) < 30:
                 self.logger.warning("Dados insuficientes para criar features")
-                return None
+                return None 
 
-            self.logger.info("Iniciando criação de features...")
+            # Verifica colunas necessárias
+            required_columns = ['close', 'high', 'low', 'open', 'volume']
             df_copy = df.copy()
             df_copy.columns = df_copy.columns.str.lower()
 
-
-            # Verifica se tem as colunas necessárias
-            required_columns = ['close', 'high', 'low', 'open', 'volume']
             if not all(col in df_copy.columns for col in required_columns):
                 self.logger.error(f"Colunas ausentes. Disponíveis: {df_copy.columns.tolist()}")
-                return None
-        
-            # Contador de features
-            feature_count = 0
+                return None 
 
-            # RSI múltiplos períodos
-            for periodo in [7, 14, 21, 28]:
-                features[f'rsi_{periodo}'] = ta.momentum.RSIIndicator(df_copy['close'], window=periodo).rsi()
-                feature_count += 1
+            self.logger.info("Calculando indicadores técnicos...")
 
-            # MACD com diferentes configurações
-            for (fast, slow, signal) in [(12, 26, 9), (8, 21, 5), (5, 35, 5)]:
-                macd = ta.trend.MACD(df_copy['close'], window_fast=fast, window_slow=slow, window_sign=signal)
+            # RSI períodos curtos
+            for periodo in [5, 8, 13]:
+                self.logger.debug(f"Calculando RSI período {periodo}")
+                features[f'rsi_{periodo}'] = ta.momentum.RSIIndicator(
+                    df_copy['close'], 
+                    window=periodo
+                ).rsi() 
+
+            # MACD otimizado
+            for (fast, slow, signal) in [(5,13,3), (3,8,2)]:
+                self.logger.debug(f"Calculando MACD {fast},{slow},{signal}")
+                macd = ta.trend.MACD(
+                    df_copy['close'],
+                    window_fast=fast,
+                    window_slow=slow,
+                    window_sign=signal
+                )
                 features[f'macd_{fast}_{slow}'] = macd.macd()
                 features[f'macd_signal_{fast}_{slow}'] = macd.macd_signal()
-                features[f'macd_diff_{fast}_{slow}'] = macd.macd_diff()
-                feature_count += 3
+                features[f'macd_diff_{fast}_{slow}'] = macd.macd_diff() 
 
-            # Bollinger Bands múltiplos períodos
-            for periodo in [20, 30, 40]:
-                bollinger = ta.volatility.BollingerBands(df_copy['close'], window=periodo)
+            # Bollinger Bands
+            for periodo in [8, 13, 21]:
+                self.logger.debug(f"Calculando Bollinger período {periodo}")
+                bollinger = ta.volatility.BollingerBands(
+                    df_copy['close'], 
+                    window=periodo,
+                    window_dev=2
+                )
                 features[f'bb_high_{periodo}'] = bollinger.bollinger_hband()
                 features[f'bb_low_{periodo}'] = bollinger.bollinger_lband()
                 features[f'bb_mid_{periodo}'] = bollinger.bollinger_mavg()
-                features[f'bb_bandwidth_{periodo}'] = bollinger.bollinger_wband()
-                feature_count += 4
+                features[f'bb_bandwidth_{periodo}'] = bollinger.bollinger_wband()   
 
-            # EMAs
-            for periodo in [9, 21, 50, 100, 200]:
-                features[f'ema_{periodo}'] = ta.trend.EMAIndicator(df_copy['close'], window=periodo).ema_indicator()
-                if periodo < 100:  # Cria distâncias percentuais apenas para médias menores
-                    features[f'dist_ema_{periodo}'] = (df_copy['close'] - features[f'ema_{periodo}']) / features[f'ema_{periodo}']
-                feature_count += 2
+            # EMAs curtas
+            for periodo in [3, 5, 8, 13, 21]:
+                self.logger.debug(f"Calculando EMA período {periodo}")
+                features[f'ema_{periodo}'] = ta.trend.EMAIndicator(
+                    df_copy['close'], 
+                    window=periodo
+                ).ema_indicator()
+                if periodo < 13:
+                    features[f'dist_ema_{periodo}'] = (
+                        df_copy['close'] - features[f'ema_{periodo}']
+                    ) / features[f'ema_{periodo}']  
 
-            # Estocástico múltiplos períodos
-            for k_periodo in [5, 14, 21]:
-                for d_periodo in [3, 5]:
+            # Estocástico rápido
+            for k_periodo in [5, 8, 13]:
+                for d_periodo in [2, 3]:
+                    self.logger.debug(f"Calculando Estocástico K{k_periodo} D{d_periodo}")
                     stoch = ta.momentum.StochasticOscillator(
-                        df_copy['high'], df_copy['low'], df_copy['close'],
-                        window=k_periodo, smooth_window=d_periodo
+                        df_copy['high'],
+                        df_copy['low'],
+                        df_copy['close'],
+                        window=k_periodo,
+                        smooth_window=d_periodo
                     )
                     features[f'stoch_k_{k_periodo}_{d_periodo}'] = stoch.stoch()
-                    features[f'stoch_d_{k_periodo}_{d_periodo}'] = stoch.stoch_signal()
-                    feature_count += 2
-
-            # ADX com diferentes períodos
-            for periodo in [14, 21]:
-                adx = ta.trend.ADXIndicator(df_copy['high'], df_copy['low'], df_copy['close'], window=periodo)
-                features[f'adx_{periodo}'] = adx.adx()
-                features[f'adx_pos_{periodo}'] = adx.adx_pos()
-                features[f'adx_neg_{periodo}'] = adx.adx_neg()
-                feature_count += 3
+                    features[f'stoch_d_{k_periodo}_{d_periodo}'] = stoch.stoch_signal() 
 
             # Volatilidade
-            for periodo in [5, 10, 20, 30]:
-                atr = ta.volatility.AverageTrueRange(
-                    df_copy['high'], df_copy['low'], df_copy['close'], window=periodo
-                )
-                features[f'atr_{periodo}'] = atr.average_true_range()
-                # Normaliza ATR pelo preço
-                features[f'atr_pct_{periodo}'] = features[f'atr_{periodo}'] / df_copy['close']
-                feature_count += 2
+            self.logger.debug("Calculando métricas de volatilidade")
+            atr = ta.volatility.AverageTrueRange(
+                df_copy['high'],
+                df_copy['low'],
+                df_copy['close'],
+                window=8
+            ).average_true_range()
 
-            # Momentum e ROC
-            for periodo in [3, 5, 10, 15, 20]:
-                mom = ta.momentum.ROCIndicator(df_copy['close'], window=periodo)
-                features[f'roc_{periodo}'] = mom.roc()
-                # Adiciona MOM usando diferença de preços
-                features[f'mom_{periodo}'] = df_copy['close'].diff(periodo)
-                feature_count += 2
+            features['volatility_ratio'] = atr / df_copy['close']
+            features['volatility_normalized'] = (
+                atr - atr.rolling(21).mean()
+            ) / atr.rolling(21).std()   
 
-            # Features de Volume (se disponível)
+            # Volume
             if 'volume' in df_copy.columns:
-                # Volume básico
-                df_copy['volume'] = df_copy['volume'].fillna(0)
+                self.logger.debug("Calculando indicadores de volume")
+                features['volume_ema_3'] = df_copy['volume'].ewm(span=3).mean()
+                features['volume_ema_8'] = df_copy['volume'].ewm(span=8).mean()
+                features['volume_ratio'] = df_copy['volume'] / features['volume_ema_8']
+                features['volume_delta'] = df_copy['volume'].pct_change()   
 
-                # Volume EMAs
-                for periodo in [5, 10, 20]:
-                    features[f'volume_ema_{periodo}'] = df_copy['volume'].ewm(span=periodo).mean()
-                    # Volume relativo à média
-                    features[f'volume_ratio_{periodo}'] = df_copy['volume'] / features[f'volume_ema_{periodo}']
-                    feature_count += 2
-
-                # Volume Delta (mudança)
-                features['volume_delta'] = df_copy['volume'].pct_change()
-
-                # Volume Price Trend (VPT)
-                features['vpt'] = (df_copy['volume'] * df_copy['close'].pct_change()).cumsum()
-
-                # Price Volume Trend (PVT)
-                features['pvt'] = df_copy['volume'] * (df_copy['close'] - df_copy['close'].shift(1)) / df_copy['close'].shift(1)
-
-                # On Balance Volume (OBV)
-                obv = 0
-                obv_list = []
-                for i in range(len(df_copy)):
-                    if i > 0:
-                        if df_copy['close'].iloc[i] > df_copy['close'].iloc[i-1]:
-                            obv += df_copy['volume'].iloc[i]
-                        elif df_copy['close'].iloc[i] < df_copy['close'].iloc[i-1]:
-                            obv -= df_copy['volume'].iloc[i]
-                    obv_list.append(obv)
-                features['obv'] = obv_list
-
-                # Force Index
-                for periodo in [13, 21]:
-                    force_index = df_copy['close'].diff() * df_copy['volume']
-                    features[f'force_index_{periodo}'] = force_index.ewm(span=periodo).mean()
-                    feature_count += 1
-
-                feature_count += 4  # volume_delta, vpt, pvt, obv
-
-            # Adiciona variações de preço
-            for periodo in [1, 2, 3, 5, 8, 13]:
-                features[f'return_{periodo}'] = df_copy['close'].pct_change(periodo)
-                feature_count += 1
-
-            # Adiciona features de tendência
-            features['trend_strength'] = abs(features['ema_9'] - features['ema_50']) / features['ema_50']
-            feature_count += 1
-            
-            # Novas features específicas para opções binárias
-            for periodo in [1, 3, 5, 15]:
-                # Momentum de curto prazo
-                features[f'price_momentum_{periodo}'] = (
-                    df_copy['close'] - df_copy['close'].shift(periodo)
-                ) / df_copy['close'].shift(periodo)
-
-                # Volatilidade de curto prazo
-                features[f'volatility_{periodo}'] = df_copy['close'].rolling(periodo).std() / df_copy['close']
-
-                # Velocidade de movimento
-                features[f'price_velocity_{periodo}'] = df_copy['close'].diff(periodo) / periodo
-
-                # Range percentual
-                features[f'range_pct_{periodo}'] = (df_copy['high'] - df_copy['low']) / df_copy['close']
-    
-            # Reversão à média
-            for periodo in [5, 10, 15]:
-                sma = df_copy['close'].rolling(periodo).mean()
-                features[f'mean_reversion_{periodo}'] = (df_copy['close'] - sma) / sma
-
-            # Aceleração de preço
-            features['price_velocity_3'] = df_copy['close'].diff(3) / 3
-            features['price_acceleration'] = features['price_velocity_3'].diff()
-    
-            # Remove valores inválidos e normaliza
+            # Limpeza final
+            self.logger.debug("Realizando limpeza dos dados")
             features = features.replace([np.inf, -np.inf], np.nan)
-            features = features.fillna(method='ffill').fillna(method='bfill').fillna(0)
+            features = features.fillna(method='ffill').fillna(0)    
 
-            self.logger.info(f"Features criadas com sucesso: {feature_count} indicadores para")
-            return features
+            self.logger.info(f"Features criadas com sucesso: {len(features.columns)} indicadores")
+            return features 
 
         except Exception as e:
             self.logger.error(f"Erro ao criar features: {str(e)}")
             return None
-        
+  
     async def treinar(self, dados_historicos) -> bool:
         """Treina o modelo de ML"""
         try:
@@ -425,6 +365,20 @@ class MLPredictor:
 
             if max(ultima_prob) < self.min_probabilidade:
                 return None
+            
+            
+            # Validação mais rigorosa
+            if max(ultima_prob) < self.min_probabilidade:
+                return None
+
+            # Calcula volatilidade normalizada
+            volatilidade = dados['Close'].pct_change().rolling(8).std() * np.sqrt(252)
+            volatilidade_norm = (
+                volatilidade - volatilidade.rolling(21).mean()
+            ) / volatilidade.rolling(21).std()
+
+            if abs(float(volatilidade_norm.iloc[-1])) > 2:
+                return None
 
             return {
                 'ativo': ativo,
@@ -432,8 +386,8 @@ class MLPredictor:
                 'probabilidade': float(max(ultima_prob)),
                 'score': float(max(ultima_prob)) * self.models[ativo]['metricas_validacao'].get('accuracy', 0),
                 'timestamp': dados.index[-1],
-                #'volatilidade': self._calcular_volatilidade(dados)
-
+                'volatilidade': float(volatilidade.iloc[-1]),
+                'volatilidade_norm': float(volatilidade_norm.iloc[-1])
             }
 
         except Exception as e:

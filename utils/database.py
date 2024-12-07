@@ -8,6 +8,8 @@ from pathlib import Path
 from queue import Queue
 from contextlib import contextmanager
 import yfinance as yf
+import asyncio
+from datetime import datetime, time
 
 class ConnectionPool:
     def __init__(self, db_path: str, max_connections: int = 5):
@@ -24,11 +26,21 @@ class ConnectionPool:
     
     @contextmanager
     def get_connection(self):
-        connection = self.connections.get()
-        try:
-            yield connection
-        finally:
-            self.connections.put(connection)
+        max_retries = 5
+        retry_delay = 0.1  # segundos
+
+        for attempt in range(max_retries):
+            try:
+                connection = self.connections.get(timeout=1)
+                try:
+                    yield connection
+                finally:
+                    self.connections.put(connection)
+                break
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise
+                asyncio.sleep(retry_delay * (attempt + 1))
     
     def close_all(self):
         while not self.connections.empty():
@@ -40,7 +52,7 @@ class DatabaseManager:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self.db_path = db_path
         self.lock = threading.Lock()
-        self.pool = ConnectionPool(db_path)
+        self.pool = ConnectionPool(db_path, max_connections=10)  # Aumentado para 1min
         self.logger = logger
         # Cache para otimização
         self.cache = {
@@ -48,7 +60,7 @@ class DatabaseManager:
             'analises': {},
             'horarios': {}
         }
-        self.cache_timeout = 300  # 5 minutos
+        self.cache_timeout = 30  
         self.cache_last_update = {}
         
         self._init_database()
@@ -58,10 +70,11 @@ class DatabaseManager:
         """Otimiza o banco de dados"""
         with self.pool.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('PRAGMA journal_mode=WAL')  # Write-Ahead Logging
-            cursor.execute('PRAGMA synchronous=NORMAL')  # Menos syncs para melhor performance
-            cursor.execute('PRAGMA cache_size=-2000')  # 2MB de cache
-            cursor.execute('PRAGMA temp_store=MEMORY')  # Temporários em memória
+            cursor.execute('PRAGMA journal_mode=WAL')
+            cursor.execute('PRAGMA synchronous=NORMAL')
+            cursor.execute('PRAGMA cache_size=-4000')  # Aumentado para 4MB
+            cursor.execute('PRAGMA temp_store=MEMORY')
+            cursor.execute('PRAGMA mmap_size=268435456')  # 256MB para mmap
             conn.commit()
     
     def _init_database(self):
@@ -72,16 +85,17 @@ class DatabaseManager:
             # Tabela de preços com particionamento por data
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS precos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ativo TEXT NOT NULL,
-                timestamp DATETIME NOT NULL,
-                open REAL NOT NULL,
-                high REAL NOT NULL,
-                low REAL NOT NULL,
-                close REAL NOT NULL,
-                volume REAL,
-                date_partition TEXT GENERATED ALWAYS AS (date(timestamp)) VIRTUAL,
-                UNIQUE(ativo, timestamp)
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ativo TEXT NOT NULL,
+                    timestamp DATETIME NOT NULL,
+                    open REAL NOT NULL,
+                    high REAL NOT NULL,
+                    low REAL NOT NULL,
+                    close REAL NOT NULL,
+                    volume REAL,
+                    date_partition TEXT GENERATED ALWAYS AS (date(timestamp)) VIRTUAL,
+                    hour_partition INTEGER GENERATED ALWAYS AS (strftime('%H', timestamp)) VIRTUAL,
+                    UNIQUE(ativo, timestamp)
                 )
             ''')
   
@@ -93,7 +107,7 @@ class DatabaseManager:
                     timestamp DATETIME NOT NULL,
                     direcao TEXT NOT NULL,
                     preco_entrada REAL NOT NULL,
-                    preco_saida REAL,  -- Nova coluna
+                    preco_saida REAL,
                     tempo_expiracao INTEGER NOT NULL,
                     score REAL NOT NULL,
                     assertividade REAL NOT NULL,
@@ -137,40 +151,74 @@ class DatabaseManager:
                     melhores_horarios TEXT NOT NULL,
                     evolucao_capital TEXT NOT NULL
                 )
+            ''')           
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS analises_detalhadas (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sinal_id INTEGER NOT NULL,
+                    dados_analise TEXT NOT NULL,
+                    timestamp DATETIME NOT NULL,
+                    FOREIGN KEY(sinal_id) REFERENCES sinais(id),
+                    UNIQUE(sinal_id)
+                )
             ''')
             
-            # Índices para sinais
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_sinais_ativo_timestamp ON sinais(ativo, timestamp)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_sinais_processado ON sinais(processado)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_precos_ativo_date ON precos(ativo, date_partition)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_precos_timestamp ON precos(timestamp)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_sinais_resultado ON sinais(resultado) WHERE resultado IS NULL;')
-          
+            # Índices otimizados
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_precos_ativo_date ON precos(ativo, date_partition, hour_partition)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_precos_timestamp_range ON precos(timestamp, ativo)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_sinais_timestamp ON sinais(timestamp, ativo)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_sinais_processado ON sinais(processado, timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_analises_sinal_id ON analises_detalhadas(sinal_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_precos_volume ON precos(volume) WHERE volume > 0')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_precos_timestamp_ativo ON precos(timestamp, ativo)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_sinais_resultado ON sinais(resultado) WHERE resultado IS NOT NULL')
+
             conn.commit()
             
     def get_horarios_sucesso(self, ativo: str) -> Dict[str, float]:
-        """Retorna os horários com maior taxa de sucesso para o ativo"""
+        """Análise de horários otimizada"""
         try:
+            cache_key = f"horarios_{ativo}"
+            if cache_key in self.cache['horarios']:
+                return self.cache['horarios'][cache_key]
+
             with self.pool.get_connection() as conn:
                 cursor = conn.cursor()
-                
+
                 query = """
-                    SELECT 
-                        strftime('%H:%M', s.timestamp) AS horario,
-                        COUNT(CASE WHEN s.resultado = 'WIN' THEN 1 END) * 1.0 / COUNT(*) AS taxa_sucesso
-                    FROM sinais s
-                    WHERE s.ativo = ?
-                    GROUP BY strftime('%H:%M', s.timestamp)
+                    WITH horarios_wins AS (
+                        SELECT 
+                            strftime('%H:%M', timestamp) AS horario,
+                            COUNT(CASE WHEN resultado = 'WIN' THEN 1 END) * 1.0 / COUNT(*) AS taxa_sucesso,
+                            COUNT(*) as total_ops
+                        FROM sinais 
+                        WHERE ativo = ?
+                        AND timestamp >= datetime('now', '-7 days')
+                        AND resultado IS NOT NULL
+                        GROUP BY strftime('%H:%M', timestamp)
+                        HAVING total_ops >= 5
+                    )
+                    SELECT horario, taxa_sucesso
+                    FROM horarios_wins
+                    WHERE taxa_sucesso >= 0.55
                     ORDER BY taxa_sucesso DESC
                 """
-                
+
                 cursor.execute(query, (ativo,))
-                
-                return {row[0]: row[1] for row in cursor.fetchall()}
-        
+                resultados = {row[0]: row[1] for row in cursor.fetchall()}
+
+                # Cache por 5 minutos
+                self.cache['horarios'][cache_key] = resultados
+
+                self.logger.info(f"Horários de sucesso calculados para {ativo}")
+                return resultados
+
         except Exception as e:
             self.logger.error(f"Erro ao obter horários de sucesso: {str(e)}")
             return {}
+      
+      
         
     def get_taxa_sucesso_horario(self, hora: int) -> float:
         """Retorna taxa de sucesso para um horário específico"""
@@ -209,12 +257,16 @@ class DatabaseManager:
                 cursor = conn.cursor()
                 
                 query = """
-                    SELECT AVG(assertividade) AS assertividade_media
-                    FROM sinais
-                    WHERE ativo = ?
-                    AND direcao = ?
-                    AND tempo_expiracao = ?
-                    AND timestamp >= datetime('now', '-7 days')
+                SELECT AVG(assertividade) as assertividade_media,
+                       COUNT(*) as total_ops,
+                       SUM(CASE WHEN resultado = 'WIN' THEN 1 ELSE 0 END) * 100.0 / COUNT(*) as win_rate
+                FROM sinais
+                WHERE ativo = ?
+                AND direcao = ?
+                AND tempo_expiracao = ?
+                AND timestamp >= datetime('now', '-3 days')
+                AND resultado IS NOT NULL
+                HAVING total_ops >= 10
                 """
                 
                 cursor.execute(query, (ativo, direcao, tempo_expiracao))
@@ -230,20 +282,30 @@ class DatabaseManager:
         
     # Adicionar novo método para salvar resultados
     async def salvar_resultados_backtest(self, resultados: Dict) -> bool:
+        """Salva resultados de backtest com métricas detalhadas"""
         try:
-            with self.transaction() as conn:
+            with await self.transaction() as conn:
                 cursor = conn.cursor()
-                
+
                 query = '''
                     INSERT INTO backtest_resultados (
-                        timestamp, total_trades, win_rate, profit_factor,
-                        drawdown_maximo, retorno_total, metricas,
-                        melhores_horarios, evolucao_capital
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        timestamp, 
+                        total_trades, 
+                        win_rate, 
+                        profit_factor,
+                        drawdown_maximo, 
+                        retorno_total, 
+                        metricas,
+                        melhores_horarios, 
+                        evolucao_capital,
+                        volatilidade_media,
+                        tempo_medio_operacao,
+                        sharpe_ratio
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 '''
-                
+
                 metricas = resultados['metricas']
-                
+
                 cursor.execute(query, (
                     datetime.now(),
                     metricas['total_trades'],
@@ -253,30 +315,72 @@ class DatabaseManager:
                     metricas['retorno_total'],
                     json.dumps(metricas),
                     json.dumps(resultados['melhores_horarios']),
-                    json.dumps(resultados['evolucao_capital'])
+                    json.dumps(resultados['evolucao_capital']),
+                    metricas.get('volatilidade_media', 0),
+                    metricas.get('tempo_medio_operacao', 0),
+                    metricas.get('sharpe_ratio', 0)
                 ))
-                
+
+                self.logger.info("Resultados do backtest salvos com sucesso")
                 return True
-                
+
         except Exception as e:
             self.logger.error(f"Erro ao salvar resultados do backtest: {str(e)}")
             return False
 
-
-    @contextmanager
-    def transaction(self):
-        """Gerenciador de contexto para transações"""
-        with self.pool.get_connection() as conn:
-            try:
-                yield conn
+    async def limpar_dados_antigos(self, dias_retencao: int = 90) -> bool:
+        """Limpa dados antigos do banco"""
+        try:
+            with self.pool.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Limpa preços antigos
+                cursor.execute("""
+                    DELETE FROM precos 
+                    WHERE timestamp < datetime('now', ? || ' days')
+                """, (-dias_retencao,))
+                
+                # Limpa sinais antigos
+                cursor.execute("""
+                    DELETE FROM sinais 
+                    WHERE timestamp < datetime('now', ? || ' days')
+                """, (-dias_retencao,))
+                
                 conn.commit()
+                self.logger.info(f"Dados anteriores a {dias_retencao} dias removidos")
+                return True
+                
+        except Exception as e:
+            self.logger.error(f"Erro na limpeza de dados: {str(e)}")
+            return False
+        
+        
+    @contextmanager
+    async def transaction(self):
+        """Gerenciador de contexto para transações com retry"""
+        max_retries = 3
+        retry_delay = 1  # segundos
+
+        for attempt in range(max_retries):
+            try:
+                with self.pool.get_connection() as conn:
+                    try:
+                        yield conn
+                        conn.commit()
+                        break
+                    except Exception as e:
+                        conn.rollback()
+                        raise e
             except Exception as e:
-                conn.rollback()
-                raise e
+                if attempt == max_retries - 1:
+                    raise
+                self.logger.warning(f"Tentativa {attempt + 1} falhou, tentando novamente...")
+                await asyncio.sleep(retry_delay * (attempt + 1))
     
             
     async def get_dados_mercado(self, ativo: str) -> pd.DataFrame:
         cache_key = f"mercado_{ativo}"
+
         try:
             # Verifica cache
             if cache_key in self.cache['dados_mercado']:
@@ -284,10 +388,7 @@ class DatabaseManager:
                 if (datetime.now() - timestamp).total_seconds() < self.cache_timeout:
                     return data
 
-            # Busca dados novos
             dados = await self._baixar_dados_mercado(ativo)
-            
-            # Salva os novos dados no banco
             await self.salvar_precos_novos(ativo, dados)
             
             if not dados.empty:
@@ -303,79 +404,66 @@ class DatabaseManager:
             return pd.DataFrame()
 
     async def _baixar_dados_mercado(self, ativo: str) -> pd.DataFrame:
-        """Baixa dados de mercado para um ativo"""
-        try:
-            # Baixa dados usando a biblioteca yfinance
-            df = yf.download(
-                ativo,
-                period="1d",
-                interval="1m",
-                progress=False
-            )
+        max_retries = 3
+        retry_delay = 2  # segundos
 
-            # Certifica-se de que todas as colunas necessárias estão presentes
-            required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
-            if all(col in df.columns for col in required_columns):
-                return df
-            else:
-                self.logger.error(f"Colunas ausentes no DataFrame para {ativo}: {', '.join(required_columns)}")
+        for attempt in range(max_retries):
+            try:
+                df = yf.download(
+                    ativo,
+                    period="1d",
+                    interval="1m",
+                    progress=False
+                )
+
+                if not df.empty:
+                    return df
+
+                if attempt < max_retries - 1:
+                    self.logger.warning(f"Tentativa {attempt + 1} falhou para {ativo}, tentando novamente...")
+                    await asyncio.sleep(retry_delay * (attempt + 1))
+
+            except Exception as e:
+                self.logger.error(f"Erro ao baixar dados de mercado para {ativo}: {str(e)}")
                 return pd.DataFrame()
 
-        except Exception as e:
-            self.logger.error(f"Erro ao baixar dados de mercado para {ativo}: {str(e)}")
-            return pd.DataFrame()
-
     async def get_preco(self, ativo: str, momento: datetime) -> Optional[float]:
-        """Recupera preço para um momento específico"""
+        """Obtém preço com otimização de busca"""
         try:
             with self.pool.get_connection() as conn:
                 cursor = conn.cursor()
-                
-                query = '''
+
+                # Busca exata primeiro
+                momento_str = momento.strftime('%Y-%m-%d %H:%M:%S')
+                cursor.execute("""
                     SELECT close
                     FROM precos
-                    WHERE ativo = ?
-                    AND timestamp = ?
+                    WHERE ativo = ? AND timestamp = ?
                     LIMIT 1
-                '''
-                
-                cursor.execute(query, (
-                    ativo,
-                    momento.strftime('%Y-%m-%d %H:%M:%S')
-                ))
-                
+                """, (ativo, momento_str))
+
                 resultado = cursor.fetchone()
-                 
                 if resultado:
                     return resultado[0]
 
-                # Se não encontrar o exato, busca o preço mais próximo
-                # dentro de uma janela de 10 segundos
-                query = '''
-                    SELECT close, timestamp,
+                # Busca mais próximo dentro de 30 segundos
+                cursor.execute("""
+                    SELECT close, 
                            ABS(STRFTIME('%s', timestamp) - STRFTIME('%s', ?)) as diff
                     FROM precos
                     WHERE ativo = ?
-                    AND timestamp BETWEEN datetime(?, '-30 seconds') AND datetime(?, '+40000 seconds')
+                      AND timestamp BETWEEN datetime(?, '-60 seconds') 
+                                      AND datetime(?, '+60 seconds')
                     ORDER BY diff ASC
                     LIMIT 1
-                '''
+                """, (momento_str, ativo, momento_str, momento_str))
 
-                cursor.execute(query, (
-                    momento.strftime('%Y-%m-%d %H:%M:%S'),
-                    ativo,
-                    momento.strftime('%Y-%m-%d %H:%M:%S'),
-                    momento.strftime('%Y-%m-%d %H:%M:%S')
-                ))
-                
                 resultado = cursor.fetchone()
                 if resultado:
-                    diff_segundos = resultado[2]
-                    if diff_segundos <= 40000:  # Só retorna se estiver dentro da janela de 10 segundos
-                        return resultado[0]
-                
+                    return resultado[0]
+
                 return None
-                
+
         except Exception as e:
             self.logger.error(f"Erro ao recuperar preço: {str(e)}")
             return None
@@ -413,23 +501,24 @@ class DatabaseManager:
             return False
 
     async def registrar_sinal(self, sinal: Dict) -> Optional[int]:
-        """Registra novo sinal no banco de dados"""
+        """Registra sinal com validações aprimoradas"""
         try:
             with self.pool.get_connection() as conn:
                 cursor = conn.cursor()
+                
+                indicadores = json.dumps(sinal.get('indicadores', {}))  # Converte para string JSON
 
-                query = '''
+
+                assertividade = min(100, max(0, sinal['assertividade']))
+                padroes = json.dumps(sinal.get('padroes_forca', 0))
+
+                cursor.execute("""
                     INSERT INTO sinais (
                         ativo, timestamp, direcao, preco_entrada,
                         tempo_expiracao, score, assertividade, padroes,
-                        ml_prob, volatilidade, indicadores,
-                        processado
+                        ml_prob, volatilidade, indicadores, processado
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                '''
-
-                assertividade = min(100, max(0, sinal['assertividade']))
-
-                cursor.execute(query, (
+                """, (
                     sinal['ativo'],
                     sinal['momento_entrada'].strftime('%Y-%m-%d %H:%M:%S'),
                     sinal['direcao'],
@@ -437,15 +526,17 @@ class DatabaseManager:
                     sinal['tempo_expiracao'],
                     sinal['score'],
                     assertividade,
-                    sinal['padroes_forca'],
+                    padroes,
                     sinal['ml_prob'],
                     sinal['volatilidade'],
-                    json.dumps(sinal['indicadores']),
+                    indicadores,  # Agora é string JSON
                     False
                 ))
 
                 conn.commit()
-                return cursor.lastrowid
+                sinal_id = cursor.lastrowid
+                self.logger.info(f"Sinal {sinal_id} registrado para {sinal['ativo']}")
+                return sinal_id
 
         except Exception as e:
             self.logger.error(f"Erro ao registrar sinal: {str(e)}")
@@ -462,12 +553,12 @@ class DatabaseManager:
                     AND s.processado = 0
                     AND datetime(s.timestamp, '+' || s.tempo_expiracao || ' minutes') <= datetime('now')
                     AND s.timestamp >= datetime('now', '-1 day')
+                    ORDER BY s.timestamp DESC
                 '''
                 
                 cursor = conn.cursor()
                 cursor.execute(query)
 
-                
                 sinais = []
                 for row in cursor.fetchall():
                     sinal = dict(row)
@@ -485,38 +576,23 @@ class DatabaseManager:
             return []
     
     async def salvar_precos_novos(self, ativo: str, dados: pd.DataFrame) -> bool:
+        """Salva preços com otimização para 1min"""
         try:
-            if not all(col in dados.columns for col in ['Open', 'High', 'Low', 'Close', 'Volume']):
-                self.logger.error(f"Colunas necessárias ausentes para {ativo}")
-                return False    
+            if dados.empty:
+                return False
 
             with self.pool.get_connection() as conn:
                 cursor = conn.cursor()
 
-                for timestamp, row in dados.iterrows():
-                    timestamp_str = timestamp.strftime('%Y-%m-%d %H:%M:%S')
+                # Batch insert/update
+                batch_size = 1000
+                for i in range(0, len(dados), batch_size):
+                    batch = dados.iloc[i:i+batch_size]
 
-                    # Tenta atualizar primeiro
-                    cursor.execute("""
-                        UPDATE precos 
-                        SET open = ?, high = ?, low = ?, close = ?, volume = ?
-                        WHERE ativo = ? AND timestamp = ?
-                    """, (
-                        float(row['Open']),
-                        float(row['High']),
-                        float(row['Low']),
-                        float(row['Close']),
-                        float(row['Volume']),
-                        ativo,
-                        timestamp_str
-                    ))
-
-                    # Se não atualizou nenhum registro, insere novo
-                    if cursor.rowcount == 0:
-                        cursor.execute("""
-                            INSERT INTO precos (ativo, timestamp, open, high, low, close, volume)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """, (
+                    values = []
+                    for timestamp, row in batch.iterrows():
+                        timestamp_str = timestamp.strftime('%Y-%m-%d %H:%M:%S')
+                        values.append((
                             ativo,
                             timestamp_str,
                             float(row['Open']),
@@ -524,13 +600,26 @@ class DatabaseManager:
                             float(row['Low']),
                             float(row['Close']),
                             float(row['Volume'])
-                        ))  
+                        ))
+
+                    cursor.executemany("""
+                        INSERT INTO precos (
+                            ativo, timestamp, open, high, low, close, volume
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(ativo, timestamp) DO UPDATE SET
+                            open=excluded.open,
+                            high=excluded.high,
+                            low=excluded.low,
+                            close=excluded.close,
+                            volume=excluded.volume
+                    """, values)
 
                 conn.commit()
-                return True 
+                self.logger.info(f"Salvos {len(dados)} registros para {ativo}")
+                return True
 
         except Exception as e:
-            self.logger.error(f"Erro ao salvar preços para {ativo}: {str(e)}")
+            self.logger.error(f"Erro ao salvar preços: {str(e)}")
             return False
     
     # Correção da função salvar_precos
@@ -591,30 +680,49 @@ class DatabaseManager:
                         volume
                     FROM precos
                     WHERE timestamp >= datetime('now', ? || ' days')
-                    ORDER BY timestamp DESC
+                    AND timestamp <= datetime('now')
+                    ORDER BY timestamp ASC
                 '''
 
                 df = pd.read_sql_query(
                     query,
                     conn,
                     params=(-dias,),
-                    parse_dates=['timestamp']
+                    parse_dates=['timestamp'],
+                    index_col='timestamp'
                 )
 
-                if not df.empty:
-                    df.set_index('timestamp', inplace=True)
-
+            if not df.empty:
+                self.logger.info(f"Dados históricos recuperados: {len(df)} registros")
                 return df
+            else:
+                self.logger.warning("Nenhum dado histórico encontrado")
+                return pd.DataFrame()
 
         except Exception as e:
             self.logger.error(f"Erro ao recuperar dados históricos: {str(e)}")
             return pd.DataFrame()
         
     async def get_dados_treino(self) -> pd.DataFrame:
-        """Recupera dados de treinamento do banco de dados"""
+        """Recupera dados de treino otimizados para ML"""
         try:
             with self.pool.get_connection() as conn:
-                query = '''
+                self.logger.debug("Iniciando recuperação de dados de treino")
+
+                query = """
+                    WITH ultimos_dados AS (
+                        SELECT 
+                            timestamp,
+                            ativo,
+                            open,
+                            high,
+                            low,
+                            close,
+                            volume,
+                            ROW_NUMBER() OVER (PARTITION BY ativo ORDER BY timestamp DESC) as rn
+                        FROM precos
+                        WHERE timestamp >= datetime('now', '-30 days')
+                    )
                     SELECT 
                         timestamp,
                         ativo,
@@ -623,10 +731,10 @@ class DatabaseManager:
                         low,
                         close,
                         volume
-                    FROM precos
-                    WHERE timestamp >= datetime('now', '-90 days')
+                    FROM ultimos_dados
+                    WHERE rn <= 43200  -- Últimos 30 dias em minutos
                     ORDER BY timestamp ASC
-                '''
+                """
 
                 df = pd.read_sql_query(
                     query,
@@ -635,7 +743,7 @@ class DatabaseManager:
                 )
 
                 if not df.empty:
-                    # Pivota os dados para formato mais adequado para treino
+                    # Pivota dados para formato ML
                     df_pivot = df.pivot(
                         index='timestamp',
                         columns='ativo',
@@ -645,7 +753,11 @@ class DatabaseManager:
                     # Achata os níveis das colunas
                     df_pivot.columns = [f"{col[1]}_{col[0]}" for col in df_pivot.columns]
 
-                return df_pivot if not df.empty else pd.DataFrame()
+                    self.logger.info(f"Dados de treino recuperados: {len(df_pivot)} registros")
+                    return df_pivot
+
+                self.logger.warning("Nenhum dado de treino encontrado")
+                return pd.DataFrame()
 
         except Exception as e:
             self.logger.error(f"Erro ao recuperar dados de treino: {str(e)}")
@@ -685,3 +797,42 @@ class DatabaseManager:
         except Exception as e:
             self.logger.error(f"Erro ao recuperar operações do período: {str(e)}")
             return []
+
+    async def salvar_analise_completa(self, sinal: Dict) -> bool:
+        try:
+            with self.pool.get_connection() as conn:
+                cursor = conn.cursor()
+
+                dados_analise = {
+                    'metricas_ml': {
+                        'probabilidade': sinal['ml_prob'],
+                        'score': sinal.get('score', 0),
+                    },
+                    'analise_tecnica': {
+                        'padroes_forca': sinal['padroes_forca'],
+                        'tendencia': sinal['tendencia'],
+                        'tech_score': sinal.get('tech_score', 0)
+                    },
+                    'analise_mercado': {
+                        'volatilidade': sinal['volatilidade'],
+                        'momento_score': sinal.get('momento_score', 0)
+                    }
+                }
+
+                # Corrigir query
+                cursor.execute("""
+                    INSERT INTO analises_detalhadas (
+                        sinal_id, dados_analise, timestamp
+                    ) VALUES (?, ?, ?)
+                """, (
+                    sinal['id'],
+                    json.dumps(dados_analise),
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                ))
+
+                conn.commit()
+                return True
+
+        except Exception as e:
+            self.logger.error(f"Erro ao salvar análise detalhada: {str(e)}")
+            return False

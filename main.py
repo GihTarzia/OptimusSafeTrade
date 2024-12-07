@@ -150,6 +150,9 @@ class TradingSystem:
             try:
                 metricas = self.gestao_risco.get_estatisticas()
                 
+                # Limpa dados antigos a cada 24 horas
+                await self.db.limpar_dados_antigos(dias_retencao=90)
+            
                 # Verifica drawdown
                 if metricas['metricas']['drawdown_atual'] > self.config.get('trading.max_drawdown'):
                     await self.pausar_operacoes()
@@ -316,38 +319,120 @@ class TradingSystem:
             self.logger.error(f"Erro ao salvar resultados do backtest: {str(e)}")
     
     def _validar_sinal(self, sinal_ml: Dict, analise_tecnica: Dict) -> bool:
-        """Valida se sinal atende critérios mínimos"""
+        """Validação rigorosa de sinais para 1min"""
         try:
             
-            if sinal_ml['direcao'] != analise_tecnica['direcao']:
-                self.logger.warning(f"Sinal rejeitado: direção ML ({sinal_ml['direcao']}) != direção técnica ({analise_tecnica['direcao']})")
-                return False
-        
-            # Score mínimo
-            if sinal_ml['probabilidade'] < self.config.get('analise.min_score_entrada'):
-                return False
             
-            # Direções concordantes
-            if sinal_ml['direcao'] != analise_tecnica['direcao']:
-                return False
-
-            # Volatilidade em range aceitável
-            volatilidade = float(sinal_ml.get('volatilidade', 0))
-            if volatilidade > 0.008 or volatilidade < 0.001:
-                return False
-
-            # Força mínima dos padrões
-            if analise_tecnica.get('forca_sinal', 0) < 0.7:  # Mínimo de 70%
-                return False
-
-            # Confirmações técnicas
-            if len(analise_tecnica.get('padroes', [])) < 3:  # Mínimo de 3 confirmações
-                return False
+            
+            
+                    # Análise Price Action
+            price_action = analise_tecnica.get('price_action', {})
+            if price_action:
+                preco_atual = float(sinal_ml.get('preco_atual', 0))
+                if sinal_ml['direcao'] == 'CALL':
+                    if preco_atual > price_action['resistencia']:
+                        return False
+                else:  # PUT
+                    if preco_atual < price_action['suporte']:
+                        return False
                 
-            return True
+                
+                
+                    # Verifica indicadores técnicos
+            indicadores = analise_tecnica.get('indicadores', {})
+            confirmacoes = 0
+
+            if indicadores.get('ema_cross') and sinal_ml['direcao'] == 'CALL':
+                confirmacoes += 1
+        
+            if abs(indicadores.get('cci', 0)) > 100:
+                if (indicadores['cci'] < -100 and sinal_ml['direcao'] == 'CALL') or \
+                   (indicadores['cci'] > 100 and sinal_ml['direcao'] == 'PUT'):
+                    confirmacoes += 1
+
+            if indicadores.get('force_index', 0) != 0:
+                if (indicadores['force_index'] > 0 and sinal_ml['direcao'] == 'CALL') or \
+                   (indicadores['force_index'] < 0 and sinal_ml['direcao'] == 'PUT'):
+                    confirmacoes += 1
+                
+                
+            # Precisa de pelo menos 2 confirmações
+            if confirmacoes < 2:
+                return False
+
+            # Validação de probabilidade ML mais rigorosa
+            if sinal_ml['probabilidade'] < 0.75:  # Aumentado threshold
+                return False
             
+            
+            # Adicionar validação de score mínimo
+            if sinal_ml.get('score', 0) < 0.4:
+                return False
+            
+            # Nova validação de volume
+            volume_ratio = float(analise_tecnica.get('volume_ratio', 0))
+            if volume_ratio < 1.2:
+                return False
+            
+            # Nova validação de tendência
+            tendencia = analise_tecnica.get('tendencia', 'NEUTRO')
+            forca_tendencia = float(analise_tecnica.get('forca_tendencia', 0))
+            if tendencia != 'NEUTRO' and forca_tendencia < 0.6:
+                return False
+
+            # Nova validação de momentum
+            momentum_score = float(analise_tecnica.get('momentum_score', 0))
+            if momentum_score < 0.55:
+                return False
+
+            # Direções devem concordar
+            if sinal_ml['direcao'] != analise_tecnica['direcao']:
+                return False
+
+            # Força mínima dos padrões aumentada
+            if analise_tecnica.get('forca_sinal', 0) < 0.8:
+                return False
+
+            # Validação de volatilidade mais restrita
+            volatilidade = float(sinal_ml.get('volatilidade', 0))
+            if not (0.001 <= volatilidade <= 0.003):  # Range mais restrito
+                return False
+
+            # Verificação de tendência
+            tendencia = analise_tecnica.get('tendencia', 'NEUTRO')
+            if tendencia != 'NEUTRO' and tendencia != sinal_ml['direcao']:
+                return False
+
+            # 1. Número mínimo de confirmações por tipo
+            confirmacoes_por_tipo = {}
+            for padrao in analise_tecnica.get('padroes', []):
+                tipo = padrao.get('tipo', '')
+                confirmacoes_por_tipo[tipo] = confirmacoes_por_tipo.get(tipo, 0) + 1
+
+            # Requer pelo menos 2 tipos diferentes de confirmação
+            if len(confirmacoes_por_tipo) < 2:
+                return False
+            
+            # 2. Verifica momentum
+            momentum_score = float(analise_tecnica.get('momentum_score', 0))
+            if momentum_score < 0.6:  # Requer momentum mínimo
+                return False
+
+            # 3. Volume mínimo
+            volume_ratio = float(analise_tecnica.get('volume_ratio', 0))
+            if volume_ratio < 1.2:  # Volume pelo menos 10% acima da média
+                return False
+
+            # 4. Padrões conflitantes
+            direcoes_padroes = [p.get('direcao') for p in analise_tecnica.get('padroes', [])]
+            if 'CALL' in direcoes_padroes and 'PUT' in direcoes_padroes:
+                return False
+
+
+            return True
+
         except Exception as e:
-            self.logger.error(f"Erro na validação: {str(e)}")
+            self.logger.error(f"Erro na validação do sinal: {str(e)}")
             return False
 
     def _simular_trade(self, timestamp: datetime, dados_futuros: pd.DataFrame, 
@@ -400,142 +485,176 @@ class TradingSystem:
         await self.notificador.enviar_mensagem(mensagem)
 
     def calcular_timing_entrada(self, ativo: str, sinal: Dict) -> Dict:
-        """Calcula o melhor momento para entrada baseado nos padrões históricos"""
+        """Timing otimizado para 1min"""
         try:
-            self.logger.debug(f"\nCalculando timing para {ativo}...")
             agora = datetime.now()
-            
-            # Analisa padrões de tempo mais favoráveis
+
+            # Análise de horários mais restrita
             horarios_sucesso = self.db.get_horarios_sucesso(ativo)
-            
             if not horarios_sucesso:
-                self.logger.warning(f"Sem histórico de horários. Usando tempo padrão.")
                 return {
-                    'momento_ideal': agora + timedelta(minutes=1),
-                    'tempo_espera': timedelta(minutes=1),
+                    'momento_ideal': agora + timedelta(seconds=30),
+                    'tempo_espera': timedelta(seconds=30),
                     'taxa_sucesso_horario': 0.5
                 }
-            
-            # Encontra melhor horário
-            melhor_horario = None
-            maior_taxa_sucesso = 0
-            
+
+            # Encontra melhor horário no próximo minuto
             hora_atual = agora.time()
+            proximos_minutos = []
+
             for horario, taxa in horarios_sucesso.items():
                 try:
                     horario_dt = datetime.strptime(horario, "%H:%M").time()
-                    if taxa > maior_taxa_sucesso:
-                        maior_taxa_sucesso = taxa
-                        melhor_horario = horario_dt
+                    if taxa >= 0.65:  # Aumentado threshold mínimo
+                        proximos_minutos.append((horario_dt, taxa))
                 except ValueError:
                     continue
-            
-            # Calcula tempo de espera
-            if melhor_horario:
-                self.logger.info(f"Melhor horário encontrado: {melhor_horario.strftime('%H:%M')}")
-                self.logger.info(f"Taxa de sucesso no horário: {maior_taxa_sucesso:.1%}")
-                
+
+            if proximos_minutos:
+                # Ordena por taxa de sucesso
+                proximos_minutos.sort(key=lambda x: x[1], reverse=True)
+                melhor_horario = proximos_minutos[0][0]
+                taxa_sucesso = proximos_minutos[0][1]
+
+                # Calcula tempo até próxima entrada
                 if hora_atual < melhor_horario:
                     tempo_espera = datetime.combine(agora.date(), melhor_horario) - datetime.combine(agora.date(), hora_atual)
                 else:
-                    tempo_espera = timedelta(minutes=1)
+                    tempo_espera = timedelta(seconds=30)  # Espera mínima
             else:
-                self.logger.warning(f"Nenhum horário ótimo encontrado. Usando tempo padrão.")
-                tempo_espera = timedelta(minutes=1)
-            
-            momento_entrada = agora + tempo_espera
-            
+                tempo_espera = timedelta(seconds=30)
+                taxa_sucesso = 0.5
+
             return {
-                'momento_ideal': momento_entrada,
+                'momento_ideal': agora + tempo_espera,
                 'tempo_espera': tempo_espera,
-                'taxa_sucesso_horario': maior_taxa_sucesso if maior_taxa_sucesso else 0.5
+                'taxa_sucesso_horario': taxa_sucesso
             }
-            
+
         except Exception as e:
             self.logger.error(f"Erro ao calcular timing: {str(e)}")
             return {
-                'momento_ideal': agora + timedelta(minutes=1),
-                'tempo_espera': timedelta(minutes=1),
+                'momento_ideal': agora + timedelta(seconds=30),
+                'tempo_espera': timedelta(seconds=30),
                 'taxa_sucesso_horario': 0.5
             }
-            
+   
     def calcular_assertividade(self, ativo: str, sinal: Dict) -> float:
-        """Calcula a probabilidade de sucesso do sinal"""
+        """Cálculo de assertividade otimizado para 1min"""
         try:
-            self.logger.debug(f"\nCalculando assertividade para {ativo}...")
-            
             # Componentes da assertividade
-            prob_ml = sinal.get('ml_prob', 0)
-            forca_padroes = float(sinal.get('score', 0))  # Usando 'score' como backup
-            
-            # Extrai probabilidade ML dos indicadores se disponível
+            prob_ml = float(sinal.get('ml_prob', 0))
+            forca_padroes = float(sinal.get('score', 0))
+
             if 'indicadores' in sinal:
                 prob_ml = float(sinal['indicadores'].get('ml_prob', prob_ml))
                 forca_padroes = float(sinal['indicadores'].get('padroes_forca', forca_padroes))
 
-            # Garante valores entre 0 e 1
+            # Normalização
             prob_ml = min(1.0, max(0.0, prob_ml))
             forca_padroes = min(1.0, max(0.0, forca_padroes))
-            
-            # Histórico específico para o tempo de expiração
-            tempo_exp = sinal.get('tempo_expiracao', 5)
+
+            # Histórico específico
+            tempo_exp = sinal.get('tempo_expiracao', 1)  # Default 1min
             historico = float(self.db.get_assertividade_recente(
                 ativo, 
                 sinal['direcao'],
                 tempo_expiracao=tempo_exp
             ) or 50) / 100
-            
-            # Verifica momento do dia
+
+            # Taxa de sucesso do horário
             hora_atual = datetime.now().hour
             horarios_sucesso = self.db.get_horarios_sucesso(ativo)
             taxa_horario = horarios_sucesso.get(f"{hora_atual:02d}:00", 0.5)
-            
-            # Analisa volatilidade
+
+            # Análise de volatilidade (mantida)
             volatilidade = float(sinal.get('volatilidade', 0))
             volatilidade_score = 1.0
             if volatilidade > 0:
-                if 0.001 <= volatilidade <= 0.005:  # Faixa ideal
+                if 0.0005 <= volatilidade <= 0.002:  # Range ideal para 1min
                     volatilidade_score = 1.0
-                elif 0.0005 <= volatilidade < 0.001:  # Baixa demais
-                    volatilidade_score = 0.7
-                elif 0.005 < volatilidade <= 0.01:  # Alta mas aceitável
+                elif 0.002 < volatilidade <= 0.003:
                     volatilidade_score = 0.8
-                else:  # Muito alta ou muito baixa
-                    volatilidade_score = 0.5
-            
-            # Verifica tendência
+                elif 0.003 < volatilidade <= 0.004:
+                    volatilidade_score = 0.6
+                else:
+                    volatilidade_score = 0.4
+
+            # Verifica tendência (mantida)
             tendencia_match = sinal.get('tendencia') == sinal.get('direcao', '')
             tendencia_score = 1.2 if tendencia_match else 0.8
-            
-            # Cálculo ponderado com pesos ajustados
-            base_score = (
-                prob_ml * 0.40 +            # Probabilidade ML (40%)
-                forca_padroes * 0.25 +      # Força dos padrões (25%)
-                historico * 0.20 +          # Histórico recente (20%)
-                volatilidade_score * 0.15 + # Score de volatilidade (15%)
-                taxa_horario * 0.20         # Performance no horário
+
+            # Novos componentes
+            momento_score = self._calcular_score_momento(sinal)
+            tech_score = self._calcular_score_tecnico(sinal)
+            historico_ponderado = self._get_historico_ponderado(
+                ativo, 
+                sinal['direcao'],
+                tempo_exp
             )
-            
-            # Aplica multiplicador de tendência
+
+            # Cálculo ponderado atualizado
+            base_score = (
+                prob_ml * 0.25 +               # ML
+                forca_padroes * 0.20 +         # Padrões técnicos
+                historico * 0.10 +             # Histórico simples
+                volatilidade_score * 0.15 +    # Volatilidade
+                historico_ponderado * 0.10 +   # Histórico ponderado (novo)
+                taxa_horario * 0.10 +          # Horário
+                momento_score * 0.10 +         # Momento (novo)
+                tech_score * 0.10              # Score técnico (novo)
+            )
+
+            # Aplica multiplicadores
             assertividade = base_score * tendencia_score
 
             # Limita entre 0 e 100
-            assertividade = min(100, max(0, assertividade * 100))
-            
-            self.logger.info(f"Componentes da assertividade:")
-            self.logger.info(f"ML: {prob_ml:.1%}")
-            self.logger.info(f"Padrões: {forca_padroes:.1%}")
-            self.logger.info(f"Histórico: {historico:.1%}")
-            self.logger.info(f"Volatilidade Score: {volatilidade_score:.1%}")
-            self.logger.info(f"Tendência Match: {tendencia_match}")
-            self.logger.info(f"Score Final: {assertividade:.1f}%")
-            self.logger.info(f"Taxa horário ({hora_atual}h): {taxa_horario:.1%}")
-            
-            return round(assertividade, 2)
-            
+            return min(100, max(0, assertividade * 100))
+
         except Exception as e:
             self.logger.error(f"Erro ao calcular assertividade: {str(e)}")
             return 0
+
+
+
+    def _calcular_score_momento(self, sinal: Dict) -> float:
+        """Calcula score baseado no momento atual"""
+        try:
+            agora = datetime.now()
+
+            # Fatores de momento
+            hora_score = self._get_hora_score(agora.hour)
+            tendencia_score = self._get_tendencia_score(sinal)
+            volatilidade_score = self._get_volatilidade_score(sinal)
+
+            return (hora_score + tendencia_score + volatilidade_score) / 3
+
+        except Exception:
+            return 0.5
+
+    def _get_historico_ponderado(self, ativo: str, direcao: str, tempo_exp: int) -> float:
+        """Retorna histórico com peso maior para operações mais recentes"""
+        try:
+            historico = self.db.get_historico_operacoes(
+                ativo, direcao, limite=20
+            )
+
+            if not historico:
+                return 0.5
+
+            pesos = [1.0 * (0.95 ** i) for i in range(len(historico))]
+            soma_pesos = sum(pesos)
+
+            win_rate_ponderado = sum(
+                peso * (1.0 if op['resultado'] == 'WIN' else 0.0)
+                for peso, op in zip(pesos, historico)
+            ) / soma_pesos
+
+            return win_rate_ponderado
+
+        except Exception:
+            return 0.5
+
 
     async def analisar_mercado(self):
         """Análise contínua do mercado"""
@@ -630,6 +749,19 @@ class TradingSystem:
                 'volatilidade':volatilidade,
             })
 
+            # NOVO: Salva análise detalhada
+            if sinal_id:
+                await self.db.salvar_analise_completa({
+                    'id': sinal_id,
+                    'ativo': sinal['ativo'],
+                    'ml_prob': float(sinal['indicadores'].get('ml_prob', 0)),
+                    'padroes_forca': float(sinal['indicadores'].get('padroes_forca', 0)),
+                    'tendencia': sinal['indicadores'].get('tendencia', 'NEUTRO'),
+                    'volatilidade': sinal['volatilidade'],
+                    'momento_score': float(sinal['indicadores'].get('momento_score', 0.5)),
+                    'tech_score': float(self._calcular_score_tecnico(sinal))
+                })
+
             # Formata mensagem completa
             sinal_formatado = {
                 'id': sinal_id,
@@ -639,7 +771,15 @@ class TradingSystem:
                 'tempo_expiracao': sinal['tempo_expiracao'],
                 'score': sinal['score'],
                 'assertividade': assertividade,
-                'indicadores': sinal['indicadores'],
+                'indicadores': {
+                    'ml_prob': float(sinal['indicadores'].get('ml_prob', 0)),
+                    'padroes_forca': float(sinal['indicadores'].get('padroes_forca', 0)),
+                    'tendencia': sinal['indicadores'].get('tendencia', 'NEUTRO'),
+                    'volume_ratio': float(sinal['indicadores'].get('volume_ratio', 1.0)),
+                    'momento_score': float(sinal['indicadores'].get('momento_score', 0.5)),
+                    'tech_score': float(self._calcular_score_tecnico(sinal))  # NOVO
+                },
+                'padroes': sinal.get('padroes', []),  # Inclui lista completa de padrões
                 'preco_entrada': preco_entrada,
                 'volatilidade': volatilidade,
             }
@@ -742,23 +882,42 @@ class TradingSystem:
             tendencia = self._analisar_tendencia(dados_mercado)
             
             # Normaliza scores individuais
-            score_ml = min(sinal_ml.get('probabilidade', 0), 0.85)  # Limita em 85%
-            score_padroes = min(analise_padroes.get('forca_sinal', 0), 0.75)  # Limita em 75%
-            score_tendencia = min(tendencia.get('forca', 0), 0.6)  # Limita em 60%
-                  
-                  
+            score_ml = float(min(sinal_ml.get('probabilidade', 0), 0.85))  # Convertido para float
+            score_padroes = float(min(analise_padroes.get('forca_sinal', 0), 0.80))  # Convertido para float
+            score_tendencia = float(min(tendencia.get('forca', 0), 0.75))  # Convertido para float  
+               
+            # Calcula score de volume
+            volume_score = self._calcular_score_volume(dados_mercado)   
+               
             # NOVO: Bloqueio imediato se direção e tendência divergirem
             if tendencia['direcao'] != direcao_ml and tendencia['direcao'] != 'NEUTRO':
                 self.logger.warning(f"Sinal descartado: divergência direção ({direcao_ml}) vs tendência ({tendencia['direcao']})")
                 return None      
-              
+            
+            # Calcula volatilidade no início (MOVIDO PARA CÁ)
+            volatilidade = dados_mercado['Close'].pct_change().rolling(20).std() * np.sqrt(252)
+            volatilidade = float(volatilidade.iloc[-1]) if not volatilidade.empty else 0
+      
             # Score base ponderado
             score_final = (
-                score_ml * 0.45 +          # 45% peso ML (reduzido)
-                score_padroes * 0.25 +     # 25% peso padrões
-                score_tendencia * 0.30     # 30% peso tendência (aumentado)
+                score_ml * 0.35 +           # ML (reduzido)
+                score_padroes * 0.25 +      # Padrões técnicos
+                score_tendencia * 0.25 +    # Tendência (aumentado)
+                volume_score * 0.15         # Volume (novo)
             )
 
+
+            # Multiplicadores de confiança
+            multiplicadores = {
+                'concordancia_direcao': 1.2 if direcao_ml == direcao_padroes else 0.8,
+                'tendencia': 1.15 if tendencia['direcao'] == direcao_ml else 0.85,
+                'volatilidade': self._get_volatilidade_multiplicador(volatilidade),
+                'momento_dia': self._get_momento_multiplicador(datetime.now())
+            }
+
+            # Aplica multiplicadores
+            for mult in multiplicadores.values():
+                score_final *= mult
 
             # Se chegou até aqui e a tendência for neutra, penaliza o score
             if tendencia['direcao'] == 'NEUTRO':
@@ -769,7 +928,7 @@ class TradingSystem:
             if direcao_ml == direcao_padroes:
                 score_final *= 1.25  # +25% (aumentado)
             if tendencia['direcao'] == direcao_ml:
-                score_final *= 0,6   # Penaliza em 40% quando há divergência
+                score_final *= 0.6   # Penaliza em % quando há divergência
 
             # Limita score final
             score_final = min(0.95, max(0.1, score_final))
@@ -784,16 +943,16 @@ class TradingSystem:
             resultado = {
                 'ativo': ativo,
                 'direcao': direcao_ml,
-                'score': score_final,
-                'ml_prob': score_ml,
-                'padroes_forca': score_padroes,
+                'score': float(score_final),  # Garantindo que é float
+                'ml_prob': float(score_ml),   # Garantindo que é float
+                'padroes_forca': float(score_padroes),  # Garantindo que é float
                 'tendencia': tendencia['direcao'],
                 'sinais': analise_padroes.get('padroes', []),
                 'tempo_expiracao': tempo_expiracao,
-                'volatilidade': volatilidade,
+                'volatilidade': float(volatilidade),  # Garantindo que é float
                 'indicadores': {
-                    'ml_prob': score_ml,
-                    'padroes_forca': score_padroes,
+                    'ml_prob': float(score_ml),
+                    'padroes_forca': float(score_padroes),
                     'tendencia': tendencia['direcao']
                 }
             }
@@ -862,80 +1021,213 @@ class TradingSystem:
             self.logger.error(f"Erro ao validar horário: {str(e)}")
             return False
 
-    
     def _analisar_tendencia(self, dados: pd.DataFrame) -> Dict:
         """Analisa a tendência atual do ativo"""
         try:
             if dados is None or dados.empty:
                 return {'direcao': 'NEUTRO', 'forca': 0}
-                
-            # Certifica que estamos usando as colunas corretas
-            if 'Close' not in dados.columns and 'close' not in dados.columns:
-                self.logger.warning(f"Colunas disponíveis: {dados.columns.tolist()}")
-                return {'direcao': 'NEUTRO', 'forca': 0}
-                
-                
+
             # Padroniza nome da coluna
             close_col = 'Close' if 'Close' in dados.columns else 'close'
             close = dados[close_col]
-            
-            # Calcula indicadores de tendência
-            ema9 = ta.trend.EMAIndicator(close, window=9).ema_indicator()
+
+            # Médias adaptativas 
+            ema3 = ta.trend.EMAIndicator(close, window=3).ema_indicator()
+            ema8 = ta.trend.EMAIndicator(close, window=8).ema_indicator()
             ema21 = ta.trend.EMAIndicator(close, window=21).ema_indicator()
+
+            # ADX para força da tendência
+            adx = ta.trend.ADXIndicator(
+                dados['High'], 
+                dados['Low'], 
+                dados['Close'],
+                window=14
+            )
+
+            # MACD e RSI originais
             macd = ta.trend.MACD(close).macd()
+            signal_line = ta.trend.MACD(close).macd_signal()
             rsi = ta.momentum.RSIIndicator(close).rsi()
-            
-            # Analisa inclinações das médias (últimos 3 períodos para mais sensibilidade)
-            inclinacao_9 = (ema9.iloc[-1] - ema9.iloc[-3]) / ema9.iloc[-3]
+
+            # Analisa inclinações das médias
+            inclinacao_3 = (ema3.iloc[-1] - ema3.iloc[-3]) / ema3.iloc[-3]
+            inclinacao_8 = (ema8.iloc[-1] - ema8.iloc[-3]) / ema8.iloc[-3]
             inclinacao_21 = (ema21.iloc[-1] - ema21.iloc[-3]) / ema21.iloc[-3]
-            
-            # Reduz o limiar para detecção de tendência
-            limiar_inclinacao = 0.0005  # 0.05% de variação
 
-            # Analisa MACD
-            macd_positivo = macd.iloc[-1] > 0
-            macd_crescente = macd.iloc[-1] > macd.iloc[-2]
-                           
-            # Analisa RSI
-            rsi_ultimo = rsi.iloc[-1]
-            rsi_crescente = rsi.iloc[-1] > rsi.iloc[-2]
-
-            # Sistema de pontos para determinar tendência
+            # Sistema de pontos aprimorado
             pontos = 0
 
-            # Análise da inclinação das médias
-            if inclinacao_9 > limiar_inclinacao: pontos += 2
-            if inclinacao_21 > limiar_inclinacao: pontos += 2
-            if inclinacao_9 < -limiar_inclinacao: pontos -= 2
-            if inclinacao_21 < -limiar_inclinacao: pontos -= 2
+            # 1. Análise de inclinações (mantida do código original)
+            limiar_inclinacao = 0.0005
+            if inclinacao_3 > limiar_inclinacao: pontos += 2
+            if inclinacao_8 > limiar_inclinacao: pontos += 1
+            if inclinacao_21 > limiar_inclinacao: pontos += 1
+            if inclinacao_3 < -limiar_inclinacao: pontos -= 2
+            if inclinacao_8 < -limiar_inclinacao: pontos -= 1
+            if inclinacao_21 < -limiar_inclinacao: pontos -= 1
 
-            # Análise do MACD
+            # 2. MACD (mantido do código original)
+            macd_positivo = macd.iloc[-1] > 0
+            macd_crescente = macd.iloc[-1] > macd.iloc[-2]
             if macd_positivo: pontos += 1
-            else: pontos -= 1
             if macd_crescente: pontos += 1
-            else: pontos -= 1
+            if not macd_positivo: pontos -= 1
+            if not macd_crescente: pontos -= 1
 
-            # Análise do RSI
+            # 3. RSI (mantido do código original)
+            rsi_ultimo = rsi.iloc[-1]
+            rsi_crescente = rsi.iloc[-1] > rsi.iloc[-2]
             if rsi_ultimo > 50 and rsi_crescente: pontos += 1
             if rsi_ultimo < 50 and not rsi_crescente: pontos -= 1
 
+            # 4. Alinhamento de médias (novo)
+            if ema3.iloc[-1] > ema8.iloc[-1] > ema21.iloc[-1]:
+                pontos += 2
+            elif ema3.iloc[-1] < ema8.iloc[-1] < ema21.iloc[-1]:
+                pontos -= 2
+
+            # 5. ADX (novo)
+            adx_value = adx.adx().iloc[-1]
+            if adx_value > 25:
+                if adx.adx_pos().iloc[-1] > adx.adx_neg().iloc[-1]:
+                    pontos += 1
+                else:
+                    pontos -= 1
+
+            # 6. Volume confirma tendência (novo)
+            volume = dados['Volume'] if 'Volume' in dados.columns else None
+            if volume is not None:
+                if volume.iloc[-1] > volume.rolling(5).mean().iloc[-1]:
+                    if close.pct_change().iloc[-1] > 0:
+                        pontos += 1
+                    else:
+                        pontos -= 1
+
             # Calcula força da tendência (normalizada entre 0 e 1)
-            forca = abs(pontos) / 8  # 8 é a pontuação máxima possível
+            max_pontos = 12  # Ajustado para o total máximo possível
+            forca = abs(pontos) / max_pontos
             forca = min(1.0, max(0.0, forca))
 
             # Determina direção
-            if pontos >= 2:
+            if pontos >= 3:  # Threshold ajustado
                 return {'direcao': 'CALL', 'forca': forca}
-            elif pontos <= -2:
+            elif pontos <= -3:
                 return {'direcao': 'PUT', 'forca': forca}
             else:
                 return {'direcao': 'NEUTRO', 'forca': forca}
-        
+
         except Exception as e:
             self.logger.error(f"Erro ao analisar tendência: {str(e)}")
             self.logger.error(f"Colunas disponíveis: {dados.columns.tolist() if dados is not None else 'None'}")
-            return {'direcao': 'NEUTRO', 'forca': 0}
-    
+            return {'direcao': 'NEUTRO', 'forca': 0}    
+
+    def _calcular_score_volume(self, dados: pd.DataFrame) -> float:
+        try:
+            volume = dados['Volume']
+            volume_ma = volume.rolling(5).mean()
+            volume_std = volume.rolling(5).std()
+
+            # Volume atual vs média
+            volume_ratio = volume.iloc[-1] / volume_ma.iloc[-1]
+
+            # Crescimento do volume
+            volume_growth = volume.pct_change().iloc[-1]
+
+            # Score baseado no volume
+            score = 0.0
+            if volume_ratio > 1.2: score += 0.3
+            if volume_ratio > 1.5: score += 0.2
+            if volume_growth > 0: score += 0.3
+            if volume.iloc[-1] > volume.iloc[-2]: score += 0.2
+
+            return min(1.0, score)
+
+        except Exception:
+            return 0.5
+
+    def _get_volatilidade_multiplicador(self, volatilidade: float) -> float:
+       """Retorna multiplicador baseado na volatilidade"""
+       if volatilidade < 0.001:
+           return 0.8  # Volatilidade muito baixa
+       elif 0.001 <= volatilidade <= 0.003:
+           return 1.2  # Volatilidade ideal
+       elif 0.003 < volatilidade <= 0.005:
+           return 1.0  # Volatilidade aceitável
+       else:
+           return 0.7  # Volatilidade muito alta
+
+    def _get_momento_multiplicador(self, momento: datetime) -> float:
+        """Retorna multiplicador baseado no momento do dia"""
+        hora = momento.hour
+        minuto = momento.minute
+
+        # Horários mais favoráveis
+        if 8 <= hora <= 11 or 14 <= hora <= 16:
+            return 1.2
+        # Horários menos favoráveis
+        elif hora < 7 or hora > 20:
+            return 0.8
+        # Evitar últimos minutos da hora
+        elif minuto >= 55:
+            return 0.85
+        else:
+            return 1.0
+        
+        
+        
+    def _calcular_score_tecnico(self, sinal: Dict) -> float:
+        """Calcula score técnico baseado nos indicadores"""
+        try:
+            indicadores = sinal.get('indicadores', {})
+
+            # Pesos para diferentes componentes
+            pesos = {
+                'tendencia': 0.4,
+                'momentum': 0.3,
+                'volume': 0.3
+            }
+
+            scores = {
+                'tendencia': 0.0,
+                'momentum': 0.0,
+                'volume': 0.0
+            }
+
+            # Score de tendência
+            if indicadores.get('tendencia') == sinal.get('direcao'):
+                scores['tendencia'] = 1.0
+            elif indicadores.get('tendencia') == 'NEUTRO':
+                scores['tendencia'] = 0.5
+
+            # Score de momentum
+            rsi = float(indicadores.get('rsi', 50))
+            if sinal['direcao'] == 'CALL' and rsi < 30:
+                scores['momentum'] = 1.0
+            elif sinal['direcao'] == 'PUT' and rsi > 70:
+                scores['momentum'] = 1.0
+            else:
+                scores['momentum'] = 0.5
+
+            # Score de volume
+            volume_ratio = float(indicadores.get('volume_ratio', 1.0))
+            if volume_ratio > 1.2:
+                scores['volume'] = 1.0
+            elif volume_ratio > 1.0:
+                scores['volume'] = 0.7
+            else:
+                scores['volume'] = 0.5
+
+            # Calcula score final ponderado
+            score_final = sum(scores[k] * pesos[k] for k in pesos)
+
+            return score_final
+
+        except Exception:
+            return 0.5
+
+
+
+
     async def verificar_resultados(self):
         """Verifica resultados das operações de forma otimizada"""
         try:
@@ -1012,18 +1304,18 @@ class TradingSystem:
     def _calcular_tempo_expiracao(self, volatilidade: float) -> int:
         """Define tempo de expiração para opções binárias"""
         try:
-            if volatilidade < 0.003:  # Volatilidade baixa
-                return 15  # Mais tempo para o movimento se desenvolver
+            if volatilidade < 0.001:  # Volatilidade baixa
+                return 5  # Mais tempo para o movimento se desenvolver
             elif volatilidade > 0.008:  # Volatilidade muito alta
                 return 1   # Tempo curto para evitar reversões
             elif volatilidade > 0.006:  # Volatilidade alta
-                return 3   # Tempo moderado-curto
+                return 2   # Tempo moderado-curto
             else:  # Volatilidade ideal
-                return 5   # Tempo padrão
+                return 3   # Tempo padrão
                 
         except Exception as e:
             self.logger.error(f"Erro ao definir tempo de expiração: {str(e)}")
-            return 5
+            return 3
    
     # TradingSystem - Correção da função baixar_dados_historicos
     async def baixar_dados_historicos(self):

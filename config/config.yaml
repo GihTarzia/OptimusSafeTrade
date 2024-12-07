@@ -10,7 +10,7 @@ sistema:
 # Ajustes no config.yaml - Adicionando novas seções
 
 ml_parametros:
-  cache_timeout: 300
+  cache_timeout: 60
   features:
     periodos_rsi: [7, 14, 21, 28]
     periodos_macd: [[12, 26, 9], [8, 21, 5], [5, 35, 5]]
@@ -58,7 +58,7 @@ trading:
   controles:
     max_operacoes_simultaneas: 10
     max_sinais_hora: 10
-    min_confirmacoes: 2
+    min_confirmacoes: 4
     tempo_entre_sinais: 300  # 5 minutos
     min_operacoes_validacao: 30
     max_exposicao_ativo: 0.20  # Máximo 20% por ativo
@@ -66,6 +66,14 @@ trading:
     min_probabilidade: 2
 
 analise:
+  indicadores_tecnicos:
+    ema_rapida: 5
+    ema_media: 13
+    cci_periodo: 20
+    force_index_periodo: 13
+    min_confirmacoes: 2
+    volume_min_ratio: 1.2
+    
   rsi:
     periodo: 14
     sobrevenda: 30
@@ -183,12 +191,12 @@ ml_config:
   min_amostras_treino: 500
   validacao_cruzada: true
   early_stopping: true
-  max_depth: 5
-  min_confirmacoes: 3
+  max_depth: 6
+  min_confirmacoes: 4
   learning_rate: 0.01
-  n_estimators: 300
-  min_probabilidade: 0.65
-  min_accuracy: 0.55
+  n_estimators: 500
+  min_probabilidade: 0.78
+  min_accuracy: 0.65
   
   parametros_avancados:
     feature_selection: true

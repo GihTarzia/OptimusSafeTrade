@@ -187,15 +187,35 @@ class Notificador:
             # Calcula força do sinal
             score = float(sinal.get('score', 0))
             forca_sinal = "⭐" * max(1, min(5, int(score * 5))) 
-
-            # Formata score e assertividade em cores
             score_formatted = f"{'🟢' if score >= 0.7 else '🟡' if score >= 0.5 else '🔴'} {score*100:.1f}%"
             assertividade = float(sinal.get('assertividade', 50.0))
             assert_formatted = f"{'🟢' if assertividade >= 70 else '🟡' if assertividade >= 50 else '🔴'} {assertividade:.1f}%"
 
             # Formata indicadores
             prob_ml = indicadores.get('ml_prob', 0) * 100
-            forca_padroes = indicadores.get('padroes_forca', 0) * 100    
+            forca_padroes = indicadores.get('padroes_forca', 0) * 100   
+            # NOVO: Formatação do Score Técnico
+            tech_score = float(indicadores.get('tech_score', 0))
+            tech_score_formatted = f"{'🟢' if tech_score >= 0.7 else '🟡' if tech_score >= 0.5 else '🔴'} {tech_score*100:.1f}%"
+
+            # NOVO: Contagem de Confirmações por Padrão
+            padroes = sinal.get('padroes', [])
+            padroes_info = []
+            for padrao in padroes:
+                nome_padrao = padrao.get('nome', '')
+                confirmacoes = padrao.get('confirmacoes', 0)
+                padroes_info.append(f"{nome_padrao} ({confirmacoes}✓)")
+
+            padroes_str = ", ".join(padroes_info) if padroes_info else "Sem padrões específicos"
+
+
+            volume_score = indicadores.get('volume_ratio', 1.0)
+            volume_emoji = "📊" if volume_score > 1.2 else "📈" if volume_score > 1.0 else "📉"
+
+            # Momento do mercado
+            momento_score = indicadores.get('momento_score', 0.5)
+            momento_emoji = "🌟" if momento_score > 0.7 else "⭐" if momento_score > 0.5 else "☆"
+
 
             mensagem = [
                 f"{'='*35}",
@@ -206,15 +226,23 @@ class Notificador:
                 f"⏰ *Horário Entrada:* {sinal['momento_entrada']}",
                 f"⌛️ *Expiração:* {sinal['tempo_expiracao']} min",
                 f"💲  *Valor:* {sinal['preco_entrada']}",
-                f"",
+                f"",   
                 f"📊 *ANÁLISE DO SINAL:* {forca_sinal}",
                 f"➤ Score: {score_formatted}",
                 f"➤ Assertividade: {assert_formatted}",
+                f"➤ Score Técnico: {tech_score_formatted}",  # NOVO
                 f"",
                 f"📈 *INDICADORES TÉCNICOS:*",
                 f"➤ Prob. ML: {prob_ml:.1f}%",
                 f"➤ Força Padrões: {forca_padroes:.1f}%",
                 f"➤ Tendência: {indicadores.get('tendencia', 'NEUTRO')}",
+                f"",
+                f"🔍 *PADRÕES IDENTIFICADOS:*",
+                f"➤ {padroes_str}",  # Agora inclui contagem de confirmações
+                f"",
+                f"📊 *ANÁLISE DE MERCADO:*",
+                f"➤ Volume: {volume_emoji} {volume_score:.1f}x média",
+                f"➤ Momento: {momento_emoji} {momento_score:.1f}",
                 f"",
                 f"⚠️ *GESTÃO DE RISCO:*",
                 f"➤ Volatilidade: {float(sinal.get('volatilidade', 0))*100:.2f}%",
@@ -234,7 +262,15 @@ class Notificador:
             resultado_emoji = "✅" if operacao['resultado'] == 'WIN' else "❌"
             direcao_emoji = "🟢" if operacao['direcao'] == 'CALL' else "🔴"
             lucro_emoji = "💰" if operacao['lucro'] > 0 else "💸"
-            
+      
+            # Análise pós-operação
+            variacao = abs(preco_saida - preco_entrada) / preco_entrada * 100
+            tempo_operacao = (operacao.get('timestamp_saida', datetime.now()) - 
+                             operacao.get('timestamp_entrada', datetime.now())).total_seconds() / 60
+      
+            # Indicadores finais
+            indicadores = operacao.get('indicadores', {})
+            padroes_confirmados = operacao.get('padroes_confirmados', [])
             # Formata valores monetários
             preco_entrada = operacao.get('preco_entrada', 0)
             preco_saida = operacao.get('preco_saida', 0)
@@ -247,13 +283,26 @@ class Notificador:
                 f"{lucro_emoji} *Resultado:* {operacao['resultado']}",
                 f"💵 *Lucro:* ${abs(operacao['lucro']):.2f}",
                 f"",
-                f"📊 *Métricas:*",
-                f"📊 *Preços:*",
+                f"📊 *Métricas da Operação:*",
+                f"• Duração: {tempo_operacao:.1f} min",
+                f"• Variação: {variacao:.2f}%",
                 f"• Entrada: ${preco_entrada}",
                 f"• Saída: ${preco_saida}",
-                f"• Id sinal: ${id}",
+                f"",
+                f"🔍 *Análise Final:*",
+                f"• Score Inicial: {operacao.get('score_entrada', 0):.1f}%",
+                f"• Assertividade Prevista: {operacao.get('assertividade_prevista', 0):.1f}%",
+                f"• Id Sinal: {operacao['id']}",
             ]
             
+            # Adiciona padrões confirmados se houver
+            if padroes_confirmados:
+                mensagem.extend([
+                    f"",
+                    f"✨ *Padrões Confirmados:*",
+                    "• " + ", ".join(padroes_confirmados)
+                ])
+
             return "\n".join(mensagem)
             
         except Exception as e:

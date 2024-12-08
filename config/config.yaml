@@ -131,20 +131,15 @@ ativos:
     - 'GBPJPY=X'
     - 'AUDJPY=X'
     - 'AUDCAD=X'
+    - 'AUDUSD=X'
+    - 'USDCAD=X'
+
   config:
     volatilidade_min: 0.0005
     volatilidade_max: 0.025
     volume_min: 50
     tempo_padrao: 1
     min_range_candle: 0.0002
-
-  limites_individuais:
-    'EURUSD=X':
-      max_exposicao: 0.15
-      min_volume: 1200
-    'GBPUSD=X':
-      max_exposicao: 0.12
-      min_volume: 1000
 
 horarios:
   inicio_operacoes: '00:00'  # Alterado de 09:00

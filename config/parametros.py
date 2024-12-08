@@ -222,9 +222,6 @@ class Config:
         try:
             ativos_filtrados = []
             for ativo in ativos:
-                # Verifica limites individuais
-                limites = self.config.get('ativos.limites_individuais', {}).get(ativo, {})
-
                 # Aplica filtros baseados na categoria
                 if categoria == 'forex':
                     if any(par in ativo for par in ['USD', 'EUR', 'GBP', 'JPY']):

@@ -48,161 +48,389 @@ class AnalisePadroesComplexos:
             }
         }
         self.cache_analises = {}
-  
+
     def _adicionar_padroes_candlestick(self, padroes: List[Padrao], dados: pd.DataFrame, config: Dict):
-        """Identifica padrões de candlestick otimizados para timeframe 1min"""
+        """Análise otimizada de padrões de candlestick"""
         try:
-            self.logger.debug("Analisando padrões de candlestick")
-            if len(dados) < 3:
+            if len(dados) < 5:
                 return
 
-            ultimo_candle = dados.iloc[-1]
-            penultimo_candle = dados.iloc[-2]
+            ultimo = dados.iloc[-1]
+            penultimo = dados.iloc[-2]
+            antepenultimo = dados.iloc[-3]
 
-            # Indicadores para confirmação
-            rsi = ta.momentum.RSIIndicator(dados['Close'], window=5).rsi().iloc[-1]
-            stoch = ta.momentum.StochasticOscillator(
-                dados['High'], 
-                dados['Low'], 
-                dados['Close'],
-                window=5,
-                smooth_window=2
-            ).stoch().iloc[-1]
+            # Volume médio
+            volume_medio = dados['Volume'].rolling(20).mean().iloc[-1]
+            volume_atual = dados['Volume'].iloc[-1]
+            volume_confirmacao = volume_atual > volume_medio * 1.2
 
-            macd = ta.trend.MACD(
-                dados['Close'],
-                window_fast=5,
-                window_slow=13,
-                window_sign=3
-            )
+            # Cálculos de tamanhos
+            def get_candle_metrics(candle):
+                corpo = abs(candle['Open'] - candle['Close'])
+                sombra_sup = candle['High'] - max(candle['Open'], candle['Close'])
+                sombra_inf = min(candle['Open'], candle['Close']) - candle['Low']
+                range_total = candle['High'] - candle['Low']
+                return corpo, sombra_sup, sombra_inf, range_total
+
+            # Tendência de curto prazo
+            ema9 = ta.trend.EMAIndicator(dados['Close'], window=9).ema_indicator()
+            tendencia = 'ALTA' if dados['Close'].iloc[-1] > ema9.iloc[-1] else 'BAIXA'
+
+            # RSI para confirmação
+            rsi = ta.momentum.RSIIndicator(dados['Close'], window=14).rsi().iloc[-1]
+
+            # MACD para confirmação  
+            macd = ta.trend.MACD(dados['Close'])
             macd_line = macd.macd().iloc[-1]
             signal_line = macd.macd_signal().iloc[-1]
 
-            volume_atual = dados['Volume'].iloc[-1] if 'Volume' in dados.columns else 0
-            volume_medio = dados['Volume'].rolling(8).mean().iloc[-1] if 'Volume' in dados.columns else 0
+            # Padrões de Reversão
 
             # 1. Doji
-            corpo = abs(ultimo_candle['Open'] - ultimo_candle['Close'])
-            range_total = ultimo_candle['High'] - ultimo_candle['Low']
-
-            if corpo <= range_total * 0.1:
+            corpo_ultimo, sombra_sup_ultimo, sombra_inf_ultimo, range_ultimo = get_candle_metrics(ultimo)
+            if corpo_ultimo <= range_ultimo * 0.1:
                 confirmacoes = 0
-                if (rsi > 45 and rsi < 55): confirmacoes += 1
-                if (stoch > 40 and stoch < 60): confirmacoes += 1
+                if volume_confirmacao: confirmacoes += 1
+                if rsi < 30 or rsi > 70: confirmacoes += 1  
                 if abs(macd_line - signal_line) < 0.0001: confirmacoes += 1
-                if volume_atual > volume_medio: confirmacoes += 1
 
-                if confirmacoes >= self.min_confirmacoes:
-                    self.logger.info(f"Doji identificado com {confirmacoes} confirmações")
+                if confirmacoes >= 2:
                     padroes.append(Padrao(
                         nome="Doji",
-                        forca=0.7 * (confirmacoes/self.min_confirmacoes),
-                        direcao="NEUTRO",
-                        confiabilidade=0.65,
+                        forca=0.7 * (confirmacoes/3),
+                        direcao="CALL" if tendencia == "BAIXA" else "PUT",
+                        confiabilidade=0.75,
                         tipo="candlestick",
                         tempo_expiracao=2,
                         confirmacoes=confirmacoes
                     ))
 
-            # 2. Martelo
-            sombra_inferior = min(ultimo_candle['Open'], ultimo_candle['Close']) - ultimo_candle['Low']
-            sombra_superior = ultimo_candle['High'] - max(ultimo_candle['Open'], ultimo_candle['Close'])
+            # 2. Hammer/Shooting Star
+            if corpo_ultimo < range_ultimo * 0.3:
+                if sombra_inf_ultimo > corpo_ultimo * 2 and sombra_sup_ultimo < corpo_ultimo:  # Hammer
+                    confirmacoes = 0
+                    if tendencia == "BAIXA": confirmacoes += 1
+                    if rsi < 30: confirmacoes += 1
+                    if volume_confirmacao: confirmacoes += 1
+                    if macd_line > signal_line: confirmacoes += 1
 
-            if sombra_inferior > corpo * 2 and sombra_superior < corpo * 0.5:
+                    if confirmacoes >= 2:
+                        padroes.append(Padrao(
+                            nome="Hammer",
+                            forca=0.85 * (confirmacoes/4),
+                            direcao="CALL",
+                            confiabilidade=0.8,
+                            tipo="candlestick",
+                            tempo_expiracao=2,
+                            confirmacoes=confirmacoes
+                        ))
+
+                elif sombra_sup_ultimo > corpo_ultimo * 2 and sombra_inf_ultimo < corpo_ultimo:  # Shooting Star
+                    confirmacoes = 0
+                    if tendencia == "ALTA": confirmacoes += 1 
+                    if rsi > 70: confirmacoes += 1
+                    if volume_confirmacao: confirmacoes += 1
+                    if macd_line < signal_line: confirmacoes += 1
+
+                    if confirmacoes >= 2:
+                        padroes.append(Padrao(
+                            nome="Shooting Star",
+                            forca=0.85 * (confirmacoes/4),
+                            direcao="PUT", 
+                            confiabilidade=0.8,
+                            tipo="candlestick",
+                            tempo_expiracao=2,
+                            confirmacoes=confirmacoes
+                        ))
+
+            # 3. Engulfing Patterns
+            corpo_pen, sombra_sup_pen, sombra_inf_pen, range_pen = get_candle_metrics(penultimo)
+
+            if (ultimo['Open'] > penultimo['Close'] and ultimo['Close'] < penultimo['Open'] and
+                corpo_ultimo > corpo_pen):  # Bearish Engulfing
                 confirmacoes = 0
+                if tendencia == "ALTA": confirmacoes += 1
+                if rsi > 70: confirmacoes += 1  
+                if volume_confirmacao: confirmacoes += 1
+                if macd_line < signal_line: confirmacoes += 1
+
+                if confirmacoes >= 2:
+                    padroes.append(Padrao(
+                        nome="Bearish Engulfing",
+                        forca=0.9 * (confirmacoes/4),
+                        direcao="PUT",
+                        confiabilidade=0.85,
+                        tipo="candlestick", 
+                        tempo_expiracao=2,
+                        confirmacoes=confirmacoes
+                    ))
+
+            elif (ultimo['Open'] < penultimo['Close'] and ultimo['Close'] > penultimo['Open'] and
+                  corpo_ultimo > corpo_pen):  # Bullish Engulfing
+                confirmacoes = 0
+                if tendencia == "BAIXA": confirmacoes += 1
                 if rsi < 30: confirmacoes += 1
-                if stoch < 20: confirmacoes += 1
+                if volume_confirmacao: confirmacoes += 1
                 if macd_line > signal_line: confirmacoes += 1
-                if volume_atual > volume_medio * 1.2: confirmacoes += 1
 
-                if dados['Close'].iloc[-3:].mean() < ultimo_candle['Close']: confirmacoes += 1
-
-                if confirmacoes >= self.min_confirmacoes:
-                    self.logger.info(f"Martelo identificado com {confirmacoes} confirmações")
+                if confirmacoes >= 2:
                     padroes.append(Padrao(
-                        nome="Martelo",
-                        forca=0.85 * (confirmacoes/self.min_confirmacoes),
+                        nome="Bullish Engulfing",
+                        forca=0.9 * (confirmacoes/4),
                         direcao="CALL",
-                        confiabilidade=0.75,
+                        confiabilidade=0.85,
                         tipo="candlestick",
                         tempo_expiracao=2,
                         confirmacoes=confirmacoes
                     ))
 
-            # 3. Estrela Cadente
-            if sombra_superior > corpo * 2 and sombra_inferior < corpo * 0.5:
-                confirmacoes = 0
-                if rsi > 70: confirmacoes += 1
-                if stoch > 80: confirmacoes += 1
-                if macd_line < signal_line: confirmacoes += 1
-                if volume_atual > volume_medio * 1.2: confirmacoes += 1
+            # 4. Three White Soldiers / Black Crows
+            if len(dados) >= 3:
+                if (all(dados.iloc[-3:]['Close'] > dados.iloc[-3:]['Open']) and  # Three White Soldiers
+                    all(dados.iloc[-3:]['Close'].diff() > 0)):
+                    confirmacoes = 0
+                    if tendencia == "BAIXA": confirmacoes += 1
+                    if volume_confirmacao: confirmacoes += 1
+                    if rsi < 50: confirmacoes += 1
+                    if macd_line > signal_line: confirmacoes += 1
 
-                if dados['Close'].iloc[-3:].mean() > ultimo_candle['Close']: confirmacoes += 1
+                    if confirmacoes >= 2:
+                        padroes.append(Padrao(
+                            nome="Three White Soldiers",
+                            forca=0.95 * (confirmacoes/4),
+                            direcao="CALL",
+                            confiabilidade=0.9,
+                            tipo="candlestick",
+                            tempo_expiracao=3,
+                            confirmacoes=confirmacoes
+                        ))
 
-                if confirmacoes >= self.min_confirmacoes:
-                    self.logger.info(f"Estrela Cadente identificada com {confirmacoes} confirmações")
-                    padroes.append(Padrao(
-                        nome="Estrela Cadente",
-                        forca=0.85 * (confirmacoes/self.min_confirmacoes),
-                        direcao="PUT",
-                        confiabilidade=0.75,
-                        tipo="candlestick",
-                        tempo_expiracao=2,
-                        confirmacoes=confirmacoes
-                    ))
+                elif (all(dados.iloc[-3:]['Close'] < dados.iloc[-3:]['Open']) and  # Three Black Crows
+                      all(dados.iloc[-3:]['Close'].diff() < 0)):
+                    confirmacoes = 0
+                    if tendencia == "ALTA": confirmacoes += 1
+                    if volume_confirmacao: confirmacoes += 1
+                    if rsi > 50: confirmacoes += 1
+                    if macd_line < signal_line: confirmacoes += 1
 
-            # 4. Engolfo de Alta
-            if (penultimo_candle['Close'] < penultimo_candle['Open'] and
-                ultimo_candle['Close'] > ultimo_candle['Open'] and
-                ultimo_candle['Open'] < penultimo_candle['Close'] and
-                ultimo_candle['Close'] > penultimo_candle['Open']):
+                    if confirmacoes >= 2:
+                        padroes.append(Padrao(
+                            nome="Three Black Crows",
+                            forca=0.95 * (confirmacoes/4),
+                            direcao="PUT",
+                            confiabilidade=0.9,
+                            tipo="candlestick",
+                            tempo_expiracao=3,
+                            confirmacoes=confirmacoes
+                        ))
 
-                confirmacoes = 0
-                if rsi > 40 and rsi < 60: confirmacoes += 1
-                if macd_line > signal_line: confirmacoes += 1
-                if stoch > 30 and stoch < 70: confirmacoes += 1
-                if volume_atual > volume_medio * 1.3: confirmacoes += 1
+            # 5. Morning/Evening Star
+            if len(dados) >= 3:
+                corpo1 = abs(dados.iloc[-3]['Close'] - dados.iloc[-3]['Open'])
+                corpo2 = abs(dados.iloc[-2]['Close'] - dados.iloc[-2]['Open'])
+                corpo3 = abs(dados.iloc[-1]['Close'] - dados.iloc[-1]['Open'])
 
-                if confirmacoes >= self.min_confirmacoes:
-                    self.logger.info(f"Engolfo de Alta identificado com {confirmacoes} confirmações")
-                    padroes.append(Padrao(
-                        nome="Engolfo de Alta",
-                        forca=0.9 * (confirmacoes/self.min_confirmacoes),
-                        direcao="CALL",
-                        confiabilidade=0.8,
-                        tipo="candlestick",
-                        tempo_expiracao=2,
-                        confirmacoes=confirmacoes
-                    ))
+                # Morning Star
+                if (corpo1 > corpo2 and corpo3 > corpo2 and
+                    dados.iloc[-3]['Close'] < dados.iloc[-3]['Open'] and
+                    dados.iloc[-1]['Close'] > dados.iloc[-1]['Open']):
+                    confirmacoes = 0
+                    if tendencia == "BAIXA": confirmacoes += 1
+                    if volume_confirmacao: confirmacoes += 1
+                    if rsi < 30: confirmacoes += 1
+                    if macd_line > signal_line: confirmacoes += 1
 
-            # 5. Engolfo de Baixa
-            if (penultimo_candle['Close'] > penultimo_candle['Open'] and
-                ultimo_candle['Close'] < ultimo_candle['Open'] and
-                ultimo_candle['Open'] > penultimo_candle['Close'] and
-                ultimo_candle['Close'] < penultimo_candle['Open']):
+                    if confirmacoes >= 2:
+                        padroes.append(Padrao(
+                            nome="Morning Star",
+                            forca=0.9 * (confirmacoes/4),
+                            direcao="CALL",
+                            confiabilidade=0.85,
+                            tipo="candlestick",
+                            tempo_expiracao=3,
+                            confirmacoes=confirmacoes
+                        ))
 
-                confirmacoes = 0
-                if rsi > 40 and rsi < 60: confirmacoes += 1
-                if macd_line < signal_line: confirmacoes += 1
-                if stoch > 30 and stoch < 70: confirmacoes += 1
-                if volume_atual > volume_medio * 1.3: confirmacoes += 1
+                # Evening Star
+                elif (corpo1 > corpo2 and corpo3 > corpo2 and
+                      dados.iloc[-3]['Close'] > dados.iloc[-3]['Open'] and
+                      dados.iloc[-1]['Close'] < dados.iloc[-1]['Open']):
+                    confirmacoes = 0
+                    if tendencia == "ALTA": confirmacoes += 1
+                    if volume_confirmacao: confirmacoes += 1
+                    if rsi > 70: confirmacoes += 1
+                    if macd_line < signal_line: confirmacoes += 1
 
-                if confirmacoes >= self.min_confirmacoes:
-                    self.logger.info(f"Engolfo de Baixa identificado com {confirmacoes} confirmações")
-                    padroes.append(Padrao(
-                        nome="Engolfo de Baixa",
-                        forca=0.9 * (confirmacoes/self.min_confirmacoes),
-                        direcao="PUT",
-                        confiabilidade=0.8,
-                        tipo="candlestick",
-                        tempo_expiracao=2,
-                        confirmacoes=confirmacoes
-                    ))
+                    if confirmacoes >= 2:
+                        padroes.append(Padrao(
+                            nome="Evening Star",
+                            forca=0.9 * (confirmacoes/4),
+                            direcao="PUT",
+                            confiabilidade=0.85,
+                            tipo="candlestick",
+                            tempo_expiracao=3,
+                            confirmacoes=confirmacoes
+                        ))
 
         except Exception as e:
-            self.logger.error(f"Erro em padrões candlestick: {str(e)}")
-            #self.logger.error(f"Stack trace: {traceback.format_exc()}")                 
-        
+            self.logger.error(f"Erro na análise de padrões candlestick: {str(e)}")
+
+    def _analise_price_action_avancada(self, dados: pd.DataFrame) -> Dict:
+        """Análise avançada de Price Action incluindo suporte/resistência e níveis chave"""
+        try:
+            if len(dados) < 50:  # Precisamos de dados suficientes
+                return {}
+
+            # Calcula níveis de suporte e resistência
+            def encontrar_niveis(precos: pd.Series, min_touches=2, noise_level=0.001):
+                niveis = []
+                for i in range(2, len(precos)-2):
+                    if (precos[i] > precos[i-1] and precos[i] > precos[i+1] and 
+                        precos[i] >= precos[i-2] and precos[i] >= precos[i+2]):
+                        niveis.append(precos[i])
+                    if (precos[i] < precos[i-1] and precos[i] < precos[i+1] and 
+                        precos[i] <= precos[i-2] and precos[i] <= precos[i+2]):
+                        niveis.append(precos[i])
+
+                # Agrupa níveis próximos
+                niveis = pd.Series(niveis).sort_values()
+                grouped_levels = []
+                current_group = [niveis.iloc[0]]
+
+                for level in niveis[1:]:
+                    if abs(level - current_group[-1]) / current_group[-1] <= noise_level:
+                        current_group.append(level)
+                    else:
+                        if len(current_group) >= min_touches:
+                            grouped_levels.append(sum(current_group) / len(current_group))
+                        current_group = [level]
+
+                return grouped_levels
+
+            # Encontra níveis importantes
+            highs = dados['High'].values
+            lows = dados['Low'].values
+            closes = dados['Close'].values
+
+            resistencias = encontrar_niveis(highs)
+            suportes = encontrar_niveis(lows)
+
+            # Calcula retração de Fibonacci
+            preco_max = max(highs[-20:])
+            preco_min = min(lows[-20:])
+            diff = preco_max - preco_min
+
+            fib_levels = {
+                0: preco_min,
+                0.236: preco_min + 0.236 * diff,
+                0.382: preco_min + 0.382 * diff,
+                0.5: preco_min + 0.5 * diff,
+                0.618: preco_min + 0.618 * diff,
+                0.786: preco_min + 0.786 * diff,
+                1: preco_max
+            }
+
+            # Identifica tendência usando múltiplos indicadores
+            ema9 = ta.trend.EMAIndicator(dados['Close'], window=9).ema_indicator()
+            ema20 = ta.trend.EMAIndicator(dados['Close'], window=20).ema_indicator()
+            ema50 = ta.trend.EMAIndicator(dados['Close'], window=50).ema_indicator()
+
+            # Força da tendência
+            adx = ta.trend.ADXIndicator(dados['High'], dados['Low'], dados['Close'])
+            adx_pos = adx.adx_pos()
+            adx_neg = adx.adx_neg()
+
+            # Canais de preço
+            upper_channel = pd.Series(highs).rolling(20).max()
+            lower_channel = pd.Series(lows).rolling(20).min()
+            channel_middle = (upper_channel + lower_channel) / 2
+
+            # Momento atual
+            preco_atual = closes[-1]
+            ema9_atual = ema9.iloc[-1]
+            ema20_atual = ema20.iloc[-1]
+            ema50_atual = ema50.iloc[-1]
+
+            # Análise de momentum
+            momentum_score = 0
+            if preco_atual > ema9_atual: momentum_score += 1
+            if ema9_atual > ema20_atual: momentum_score += 1
+            if ema20_atual > ema50_atual: momentum_score += 1
+
+            # Proximidade com níveis importantes
+            def calc_proximidade(preco, nivel, threshold=0.0015):
+                return abs(preco - nivel) / nivel <= threshold
+
+            # Verifica níveis próximos
+            niveis_proximos = {
+                'suporte': next((s for s in suportes if calc_proximidade(preco_atual, s)), None),
+                'resistencia': next((r for r in resistencias if calc_proximidade(preco_atual, r)), None),
+                'fib': next((level for fib, level in fib_levels.items() if calc_proximidade(preco_atual, level)), None)
+            }
+
+            # Determina direção baseada na análise completa
+            tendencia_ema = "ALTA" if ema9_atual > ema20_atual > ema50_atual else \
+                           "BAIXA" if ema9_atual < ema20_atual < ema50_atual else "NEUTRO"
+
+            forca_tendencia = adx.adx().iloc[-1] / 100  # Normaliza entre 0 e 1
+
+            # Calcula reversão potencial
+            reversao_prob = 0
+            if niveis_proximos['resistencia'] and tendencia_ema == "ALTA":
+                reversao_prob += 0.3
+            if niveis_proximos['suporte'] and tendencia_ema == "BAIXA":
+                reversao_prob += 0.3
+            if niveis_proximos['fib']:
+                reversao_prob += 0.2
+
+            # Volume como confirmação
+            volume = dados['Volume'].values
+            volume_medio = np.mean(volume[-20:])
+            volume_atual = volume[-1]
+            volume_crescente = volume_atual > volume_medio * 1.2
+
+            # Consolidação final
+            resultado = {
+                'niveis': {
+                    'suportes': suportes,
+                    'resistencias': resistencias,
+                    'fib_levels': fib_levels
+                },
+                'tendencia': {
+                    'direcao': tendencia_ema,
+                    'forca': float(forca_tendencia),
+                    'momentum_score': momentum_score / 3  # Normaliza para 0-1
+                },
+                'canais': {
+                    'superior': float(upper_channel.iloc[-1]),
+                    'medio': float(channel_middle.iloc[-1]),
+                    'inferior': float(lower_channel.iloc[-1])
+                },
+                'reversao': {
+                    'probabilidade': reversao_prob,
+                    'nivel_proximo': next(k for k, v in niveis_proximos.items() if v is not None),
+                    'distancia_nivel': min(abs(preco_atual - nivel) for nivel in [n for n in niveis_proximos.values() if n is not None])
+                },
+                'volume': {
+                    'status': 'ALTO' if volume_crescente else 'NORMAL',
+                    'ratio': float(volume_atual / volume_medio)
+                },
+                'sinais': {
+                    'direcao': 'PUT' if (tendencia_ema == 'ALTA' and reversao_prob > 0.5) or
+                                      (tendencia_ema == 'BAIXA' and forca_tendencia > 0.7) else
+                              'CALL' if (tendencia_ema == 'BAIXA' and reversao_prob > 0.5) or
+                                       (tendencia_ema == 'ALTA' and forca_tendencia > 0.7) else 'NEUTRO',
+                    'forca': float(min(forca_tendencia + (momentum_score/3), 1.0)),
+                    'confiabilidade': float(0.7 * forca_tendencia + 0.3 * (volume_atual/volume_medio))
+                }
+            }
+
+            return resultado
+
+        except Exception as e:
+            self.logger.error(f"Erro na análise de Price Action: {str(e)}")
+            return {}
+   
     def _adicionar_padroes_tendencia(self, padroes: List[Padrao], dados: pd.DataFrame, config: Dict):
         """Identifica padrões de tendência otimizados para timeframe 1min"""
         try:
@@ -743,6 +971,7 @@ class AnalisePadroesComplexos:
 
             # Adiciona indicadores técnicos
             indicadores = self._adicionar_indicadores_tecnico(dados)
+            price_action_avancado = self._analise_price_action_avancada(dados)
 
             if not dados.empty:
                 # Identifica padrões
@@ -779,6 +1008,19 @@ class AnalisePadroesComplexos:
                 if abs(float(volatilidade_norm.iloc[-1])) > 2:
                     self.logger.warning("Volatilidade muito alta, sinal descartado")
                     return None
+
+
+                # Valida concordância entre Price Action e padrões técnicos
+                if price_action_avancado.get('sinais', {}).get('direcao') != 'NEUTRO':
+                    if price_action_avancado['sinais']['direcao'] != direcao:
+                        self.logger.warning("Divergência entre Price Action e análise técnica")
+                        if price_action_avancado['sinais']['forca'] < 0.8 and forca_sinal < 0.8:
+                            return None
+                    else:
+                        # Aumenta força do sinal quando há concordância
+                        forca_sinal = min(1.0, forca_sinal * 1.2)
+
+
 
                 resultado = {
                     'ativo': ativo,

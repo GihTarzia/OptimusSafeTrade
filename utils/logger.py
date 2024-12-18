@@ -66,7 +66,7 @@ class AlertManager:
             ]
 
 class TradingLogger:
-    def __init__(self, log_dir: str = 'data', max_files: int = 1000):
+    def __init__(self, log_dir: str = 'data', max_files: int = 5):
         # Remove todos os handlers existentes para evitar duplicação
         logger = logging.getLogger()
         for handler in logger.handlers[:]:

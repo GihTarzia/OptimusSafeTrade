@@ -247,6 +247,6 @@ database:
   path: 'data/trading_bot.db'
   backup_automatico: true
   intervalo_backup: 86400  # 24 horas
-  max_registros: 1000000
+  max_registros: 10000
   limpar_automatico: true
-  dias_retencao: 90
+  dias_retencao: 1
